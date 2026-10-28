@@ -1,0 +1,55 @@
+name: GeM Government Tender Radar & AI Lead Scraper
+
+on:
+  schedule:
+    # Runs automatically every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (Scrapes without saving to database)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  scrape-and-sync:
+    name: Scrape GeM Bids & Sync Category Pools + Vendor Feeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run GeM AI Lead Scraper
+        env:
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          ZIVIC_BASE_URL: ${{ secrets.ZIVIC_BASE_URL }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SENSHRADDHA_SUPABASE_PROJECT2_URL: ${{ secrets.SENSHRADDHA_SUPABASE_PROJECT2_URL }}
+          SENSHRADDHA_SUPABASE_PROJECT2_SERVICE_ROLE_KEY: ${{ secrets.SENSHRADDHA_SUPABASE_PROJECT2_SERVICE_ROLE_KEY }}
+          SERPERDEV_API: ${{ secrets.SERPERDEV_API }}
+          SCRAPERAPI_KEYS: ${{ secrets.SCRAPERAPI_KEYS }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          GOOGLE_KEYS: ${{ secrets.GOOGLE_KEYS }}
+          GOOGLE_CX: ${{ secrets.GOOGLE_CX }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python gem_scraper.py --dry-run
+          else
+            python gem_scraper.py
+          fi
