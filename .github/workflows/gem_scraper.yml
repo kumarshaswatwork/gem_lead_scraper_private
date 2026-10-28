@@ -2,8 +2,8 @@ name: GeM Government Tender Radar & AI Lead Scraper
 
 on:
   schedule:
-    # Runs automatically every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
-    - cron: '0 */4 * * *'
+    # Runs at 03:00 UTC (8:30 AM IST) in time for 9:00 AM dispatch, plus 09:00, 15:00, 21:00 UTC
+    - cron: '0 3,9,15,21 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
