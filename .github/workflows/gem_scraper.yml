@@ -54,17 +54,17 @@ jobs:
             python gem_scraper.py
           fi
 
-      - name: Trigger Morning Lead Alerts & Notifications
+      - name: Trigger 30-Minute Staging Window & Admin Email Alert
         if: success() && github.event.inputs.dry_run != 'true'
         env:
           ZIVIC_BASE_URL: ${{ secrets.ZIVIC_BASE_URL || 'https://zivicnexus.com' }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
-          echo "Triggering GeM Tender Alerts Dispatch..."
+          echo "Initiating 30-Minute GeM Staging & Admin Verification Alert..."
           BASE_URL="${ZIVIC_BASE_URL:-https://zivicnexus.com}"
           AUTH_TOKEN="${CRON_SECRET:-$SCRAPER_API_KEY}"
-          curl -s -X POST "${BASE_URL}/api/cron/morning-lead-alerts?force=true&hours=24" \
+          curl -s -X POST "${BASE_URL}/api/cron/stage-leads?minutes=30&source=gem_scraper_actions" \
             -H "Authorization: Bearer ${AUTH_TOKEN}" \
             -H "x-scraper-key: ${SCRAPER_API_KEY}" \
-            -H "Content-Type: application/json" || echo "Alert dispatch completed or timed out"
+            -H "Content-Type: application/json" || echo "Staging initiation completed or timed out"
