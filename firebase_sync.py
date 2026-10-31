@@ -195,9 +195,9 @@ class FirebaseSyncManager:
             or os.environ.get("NEXT_PUBLIC_SITE_URL")
             or ""
         ).rstrip("/")
-        # Avoid using localhost in non-running local CLI unless explicitly set via ZIVIC_BASE_URL
-        if "localhost" in raw_base and not os.environ.get("ZIVIC_BASE_URL"):
-            self.api_base_url = ""
+        # Default to production domain so HTTP API fallback works reliably everywhere
+        if not raw_base or ("localhost" in raw_base and not os.environ.get("ZIVIC_BASE_URL")):
+            self.api_base_url = "https://zivicnexus.com"
         else:
             self.api_base_url = raw_base
 
