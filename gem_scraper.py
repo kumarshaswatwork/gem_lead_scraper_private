@@ -62,7 +62,9 @@ from firebase_sync import (
     FirebaseSyncManager,
     CANONICAL_CATEGORY_BUCKETS,
     get_gem_queries_for_category,
+    classify_tender,
 )
+
 
 # Core baseline categories always kept warm so newly upgrading Premium/Titan/Elite vendors see tenders immediately
 DEFAULT_WARM_CATEGORY_SLUGS = [
@@ -72,6 +74,7 @@ DEFAULT_WARM_CATEGORY_SLUGS = [
     "web-app-development",
     "catering-hospitality",
     "medical-oxygen-equipment",
+    "water-treatment-etp-stp",
 ]
 
 
@@ -175,7 +178,16 @@ def run_scraper(dry_run: bool = False):
         general_bids = portal_client.fetch_all_bids_ajax(keyword="", page=1)
         for b in general_bids:
             bid_id = b.get("bid_id")
-            if bid_id and bid_id not in all_tenders_by_id:
+            if not bid_id:
+                continue
+            if not b.get("matched_category_slug"):
+                inferred_cat = classify_tender(b)
+                if inferred_cat:
+                    b["matched_category_slug"] = inferred_cat
+            cat_slug = b.get("matched_category_slug")
+            if cat_slug:
+                tenders_by_category[cat_slug][bid_id] = b
+            if bid_id not in all_tenders_by_id:
                 all_tenders_by_id[bid_id] = b
     except Exception as e:
         logger.warning(f"General all-bids sweep warning: {e}")
@@ -224,23 +236,27 @@ def run_scraper(dry_run: bool = False):
         c_label = vendor.get("category_label") or "General Marketplace"
         business_name = vendor.get("business_name") or vendor.get("email") or vendor_id
 
-        # Combine category pool tenders + general sweep for vendor-specific address scoring
-        candidate_pool = list(tenders_by_category.get(c_slug, {}).values()) + total_tenders
+        # Combine category pool tenders + general sweep matching this category for vendor-specific address scoring
+        candidate_pool = list(tenders_by_category.get(c_slug, {}).values())
+        for t in total_tenders:
+            if t.get("matched_category_slug") == c_slug:
+                candidate_pool.append(t)
         dedup_candidates = list({t["bid_id"]: t for t in candidate_pool if t.get("bid_id")}.values())
         matched_tenders = sync_manager.match_tenders_to_vendor(vendor, dedup_candidates)
 
         logger.info(
             f"Vendor '{business_name}' ({vendor_id}) [Category: {c_label}]: Matched {len(matched_tenders)} tenders."
         )
-        if matched_tenders:
-            res = sync_manager.sync_target_inquiries(
-                target_doc_id=vendor_id,
-                new_inquiries=matched_tenders,
-                category_slug=c_slug,
-                category_label=c_label,
-            )
-            total_synced += res.get("synced", 0)
-            total_pruned += res.get("pruned", 0)
+        # Always sync for each vendor so that when a vendor updates niche, stale inquiries are purged even if 0 new tenders match today!
+        res = sync_manager.sync_target_inquiries(
+            target_doc_id=vendor_id,
+            new_inquiries=matched_tenders,
+            category_slug=c_slug,
+            category_label=c_label,
+        )
+        total_synced += res.get("synced", 0)
+        total_pruned += res.get("pruned", 0)
+
 
     logger.info("=" * 68)
     logger.info("GeM AI Lead Finder Scraper Job Completed Successfully!")

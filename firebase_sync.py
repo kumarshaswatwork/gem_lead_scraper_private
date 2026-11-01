@@ -92,8 +92,19 @@ CANONICAL_CATEGORY_BUCKETS: List[Dict[str, Any]] = [
     {
         "slug": "medical-oxygen-equipment",
         "label": "Medical Oxygen & Hospital Equipment",
-        "keywords": ["oxygen plant", "psa plant", "medical oxygen", "oxygen concentrator", "medical gas pipeline", "mgps", "hospital equipment"],
+        "keywords": ["oxygen plant", "psa plant", "psa", "oxyygen", "medical oxygen", "oxygen concentrator", "medical gas pipeline", "mgps", "hospital equipment"],
         "gem_queries": ["Oxygen Plant", "Oxygen Concentrator", "Medical Gas Pipeline"],
+    },
+    {
+        "slug": "water-treatment-etp-stp",
+        "label": "Water Treatment, STP & ETP Plants",
+        "keywords": [
+            "waste water", "wastewater", "etp", "stp", "etp-stp",
+            "effluent treatment", "sewage treatment", "water treatment",
+            "water treatment plant", "ro plant", "dm plant",
+            "water purification", "water quality", "pollution control",
+        ],
+        "gem_queries": ["Water Treatment", "Effluent Treatment", "Sewage Treatment", "RO Plant"],
     },
     {
         "slug": "heavy-engineering-machinery",
@@ -122,25 +133,33 @@ def _slugify(val: str) -> str:
     return re.sub(r"^-+|-+$", "", re.sub(r"[^a-z0-9]+", "-", (val or "").lower()))[:64]
 
 
+def classify_tender(tender: Dict[str, Any]) -> Optional[str]:
+    """Classifies an untagged tender by matching title, department, or category against canonical keywords."""
+    blob = f"{tender.get('title', '')} {tender.get('category_name', '')} {tender.get('department', '')}".lower()
+    for bucket in CANONICAL_CATEGORY_BUCKETS:
+        if any(kw in blob for kw in bucket["keywords"]):
+            return bucket["slug"]
+    return None
+
+
 def resolve_vendor_category(vendor: Dict[str, Any]) -> Tuple[str, str]:
     """
     Deterministically resolves `(category_slug, category_label)` for a vendor,
     matching `resolveVendorCategory` in `lib/leads/category-lead-routing.ts`.
     """
-    existing_slug = str(vendor.get("category_slug") or "").strip()
-    existing_label = str(vendor.get("category_label") or "").strip()
-    if existing_slug and existing_slug != "general-marketplace":
-        if existing_slug in BUCKET_BY_SLUG:
-            return existing_slug, BUCKET_BY_SLUG[existing_slug]["label"]
-        if existing_label:
-            return existing_slug, existing_label
-
     sub_niche = str(vendor.get("sub_niche") or "").strip()
     niche = str(vendor.get("niche") or "").strip()
     what_sell = str(vendor.get("what_sell") or "").strip()
     industry = str(vendor.get("industry") or "").strip()
     vp_slug = str(vendor.get("vp_category_slug") or "").strip()
 
+    # 1. Check vendor's explicit niche / sub-niche first (e.g. Oxygen Plant, Waste Water Treatment)
+    niche_blob = f"{sub_niche} {niche}".lower()
+    for bucket in CANONICAL_CATEGORY_BUCKETS:
+        if any(kw in niche_blob for kw in bucket["keywords"]):
+            return bucket["slug"], bucket["label"]
+
+    # 2. Check full primary blob including what_sell
     primary_blob = f"{sub_niche} {niche} {what_sell}".lower()
     for bucket in CANONICAL_CATEGORY_BUCKETS:
         if any(kw in primary_blob for kw in bucket["keywords"]):
@@ -153,6 +172,7 @@ def resolve_vendor_category(vendor: Dict[str, Any]) -> Tuple[str, str]:
             if len(slug) >= 2:
                 return slug, clean
 
+    # 3. Check secondary signals (vendor_profile category / industry)
     secondary_blob = f"{vp_slug} {industry}".lower()
     for bucket in CANONICAL_CATEGORY_BUCKETS:
         if any(kw in secondary_blob for kw in bucket["keywords"]):
@@ -165,7 +185,17 @@ def resolve_vendor_category(vendor: Dict[str, Any]) -> Tuple[str, str]:
             if len(slug) >= 2:
                 return slug, clean.replace("-", " ").title()
 
+    # 4. Fallback to existing valid slug if present
+    existing_slug = str(vendor.get("category_slug") or "").strip()
+    existing_label = str(vendor.get("category_label") or "").strip()
+    if existing_slug and existing_slug != "general-marketplace":
+        if existing_slug in BUCKET_BY_SLUG:
+            return existing_slug, BUCKET_BY_SLUG[existing_slug]["label"]
+        if existing_label:
+            return existing_slug, existing_label
+
     return "general-marketplace", "General Marketplace"
+
 
 
 def get_gem_queries_for_category(category_slug: str, category_label: str, vendors_in_cat: List[Dict[str, Any]]) -> List[str]:
@@ -300,11 +330,11 @@ class FirebaseSyncManager:
                             bp = bp_by_em.get(em)
                             if bp:
                                 ident = (bp.get("raw_inputs") or {}).get("identity") or {}
-                                v["business_name"] = v.get("business_name") or bp.get("business_name") or ident.get("businessName")
-                                v["niche"] = v.get("niche") or ident.get("niche")
-                                v["sub_niche"] = v.get("sub_niche") or ident.get("subNiche")
-                                v["what_sell"] = v.get("what_sell") or ident.get("whatYouSell")
-                                v["industry"] = v.get("industry") or bp.get("industry") or ident.get("industry")
+                                v["business_name"] = ident.get("businessName") or bp.get("business_name") or v.get("business_name")
+                                v["niche"] = ident.get("niche") or v.get("niche")
+                                v["sub_niche"] = ident.get("subNiche") or v.get("sub_niche")
+                                v["what_sell"] = ident.get("whatYouSell") or v.get("what_sell")
+                                v["industry"] = ident.get("industry") or bp.get("industry") or v.get("industry")
             except Exception as e:
                 logger.debug(f"SENSHRADDHA business_profiles enrichment skipped: {e}")
 
@@ -361,8 +391,8 @@ class FirebaseSyncManager:
 
     def match_tenders_to_vendor(self, vendor: Dict[str, Any], tenders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Matches category tenders to a vendor, boosting tenders whose city/state/department
-        matches the vendor's physical address!
+        Matches category tenders to a vendor, strictly rejecting other categories and
+        boosting tenders whose city/state/department matches the vendor's physical address!
         """
         v_cat = vendor.get("category_slug") or "general-marketplace"
         addr_tokens = [
@@ -370,13 +400,22 @@ class FirebaseSyncManager:
             if len(tok) >= 3 and tok not in {"india", "road", "near", "nagar", "colony", "sector"}
         ]
 
+        VENDOR_KEYWORD_STOPWORDS = {
+            "with", "from", "services", "service", "products", "product", "also",
+            "provide", "provides", "providing", "plant", "plants", "new", "deal",
+            "deals", "dealing", "supply", "supplies", "supplying", "maintenance",
+            "mantainence", "repair", "work", "works", "near", "good", "best",
+            "contract", "have", "need", "make", "more", "some", "than", "they",
+            "this", "that", "hospital", "hospitals", "private", "public", "online",
+        }
+
         keywords = set()
         for field in ["niche", "sub_niche", "what_sell", "industry"]:
             val = str(vendor.get(field) or "").strip().lower()
             if val:
                 keywords.add(val)
                 for w in re.split(r"[^a-z0-9]+", val):
-                    if len(w) >= 4 and w not in {"with", "from", "services", "service", "products"}:
+                    if len(w) >= 4 and w not in VENDOR_KEYWORD_STOPWORDS:
                         keywords.add(w)
 
         matched: List[Dict[str, Any]] = []
@@ -384,6 +423,10 @@ class FirebaseSyncManager:
             t_cat = t.get("matched_category_slug")
             t_text = f"{t.get('title', '')} {t.get('department', '')} {t.get('category_name', '')}".lower()
             loc_text = f"{t.get('city', '')} {t.get('state', '')} {t.get('department', '')}".lower()
+
+            # Strict category guard: never match tenders tagged with another category!
+            if t_cat and v_cat != "general-marketplace" and t_cat != v_cat:
+                continue
 
             same_category = bool(t_cat and t_cat == v_cat)
             kw_hit = any(kw in t_text for kw in keywords)
@@ -413,27 +456,41 @@ class FirebaseSyncManager:
         or `{vendor_id}`), strictly preserving earliest `found_date` / `discovered_at` so
         Lead Delivery Speed timers never reset!
         """
-        if not new_inquiries:
-            return {"synced": 0, "pruned": 0}
-
         is_pool = target_doc_id.startswith("__category__:")
+        if not new_inquiries and is_pool:
+            return {"synced": 0, "pruned": 0}
 
         if self.db:
             try:
-                doc_ref = self.db.collection("gem_vendor_feeds").doc(target_doc_id)
+                doc_ref = self.db.collection("gem_vendor_feeds").document(target_doc_id)
                 snap = doc_ref.get()
                 existing_data = (snap.to_dict() or {}) if snap.exists else {}
                 existing_inquiries: Dict[str, Any] = existing_data.get("inquiries") or {}
                 now_iso = datetime.now(timezone.utc).isoformat()
 
+                if not is_pool and category_slug:
+                    existing_cat = existing_data.get("category_slug")
+                    if existing_cat and existing_cat != category_slug:
+                        logger.info(f"Vendor '{target_doc_id}' changed category from '{existing_cat}' to '{category_slug}'. Resetting stale inquiries.")
+                        existing_inquiries = {}
+                    else:
+                        # Clean out any mismatched category inquiries from previous runs
+                        existing_inquiries = {
+                            bid_id: inq
+                            for bid_id, inq in existing_inquiries.items()
+                            if isinstance(inq, dict) and (not inq.get("matched_category_slug") or inq.get("matched_category_slug") == category_slug)
+                        }
+
                 merged_inquiries = dict(existing_inquiries)
                 synced_count = 0
 
-                for inq in new_inquiries:
+                for inq in (new_inquiries or []):
                     bid_id = inq.get("bid_id")
                     if not bid_id:
                         continue
-                    prev = existing_inquiries.get(bid_id) or {}
+                    prev = existing_inquiries.get(bid_id)
+                    if not isinstance(prev, dict):
+                        prev = {}
                     prev_disc = prev.get("discovered_at") or prev.get("found_date")
                     cand_disc = inq.get("discovered_at") or inq.get("found_date") or now_iso
                     earliest_disc = prev_disc if prev_disc and prev_disc <= cand_disc else cand_disc
@@ -459,7 +516,10 @@ class FirebaseSyncManager:
                 if category_label:
                     payload["category_label"] = category_label
 
-                doc_ref.set(payload, merge=True)
+                if snap.exists:
+                    doc_ref.update(payload)
+                else:
+                    doc_ref.set(payload)
                 pruned = self.prune_expired_inquiries(target_doc_id)
                 logger.info(
                     f"[Firestore] Target '{target_doc_id}': Synced {synced_count} tenders, pruned {pruned} expired."
@@ -477,7 +537,7 @@ class FirebaseSyncManager:
                 }
                 payload = {
                     "vendorId": target_doc_id,
-                    "inquiries": new_inquiries,
+                    "inquiries": new_inquiries or [],
                     "categorySlug": category_slug,
                     "categoryLabel": category_label,
                 }
@@ -506,22 +566,32 @@ class FirebaseSyncManager:
 
         try:
             from firebase_admin import firestore
-            doc_ref = self.db.collection("gem_vendor_feeds").doc(vendor_id)
+            doc_ref = self.db.collection("gem_vendor_feeds").document(vendor_id)
             snap = doc_ref.get()
             if not snap.exists:
                 return 0
 
             data = snap.to_dict() or {}
             inquiries = data.get("inquiries", {})
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_utc = datetime.now(timezone.utc)
 
             deletes = {}
             pruned_count = 0
             for bid_id, inq in inquiries.items():
-                expiry = (inq or {}).get("expiry_date")
-                if expiry and expiry < now_iso:
+                if not isinstance(inq, dict):
                     deletes[f"inquiries.{bid_id}"] = firestore.DELETE_FIELD
-                    pruned_count += 1
+                    continue
+                expiry = inq.get("expiry_date") or inq.get("expiry")
+                if expiry:
+                    try:
+                        exp_dt = datetime.fromisoformat(expiry)
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                        if exp_dt < now_utc:
+                            deletes[f"inquiries.{bid_id}"] = firestore.DELETE_FIELD
+                            pruned_count += 1
+                    except (ValueError, TypeError):
+                        pass
 
             if deletes:
                 doc_ref.update(deletes)
@@ -529,3 +599,4 @@ class FirebaseSyncManager:
         except Exception as e:
             logger.error(f"Error pruning expired inquiries for {vendor_id}: {e}")
             return 0
+
