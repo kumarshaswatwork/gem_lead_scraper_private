@@ -77,6 +77,9 @@ DEFAULT_WARM_CATEGORY_SLUGS = [
     "water-treatment-etp-stp",
 ]
 
+# Strict 15-Minute Global Execution Timer (14-min safety break before timeout)
+GLOBAL_TIMEOUT_SECONDS = 14 * 60
+
 
 def _extract_vendor_location_hints(vendors: List[Dict[str, Any]]) -> List[str]:
     """Extracts unique Indian states/cities from subscribed vendors' physical addresses."""
@@ -94,9 +97,11 @@ def _extract_vendor_location_hints(vendors: List[Dict[str, Any]]) -> List[str]:
 
 
 def run_scraper(dry_run: bool = False):
+    start_time = time.time()
     logger.info("=" * 68)
     logger.info("Starting GeM AI Lead Finder — Category-Pooled Tender Scraper")
-    logger.info("Target: Government e-Marketplace (bidplus.gem.gov.in)")
+    logger.info("Target: Government e-Marketplace (bidplus.gem.gov.in) & Aggregators")
+    logger.info(f"Execution Budget: 15 Minutes (14-min safety cutoff at {GLOBAL_TIMEOUT_SECONDS}s)")
     logger.info(f"Mode: {'DRY RUN (No database writes)' if dry_run else 'LIVE PRODUCTION SYNC'}")
     logger.info("=" * 68)
 
@@ -131,7 +136,13 @@ def run_scraper(dry_run: bool = False):
 
     # Step 2: Scrape GeM Portal per Business Category (+ Vendor Location Hints)
     logger.info("\n--- Phase 1: Category & Location-Aware GeM Tender Mining ---")
+    timed_out = False
     for cat_slug in active_category_slugs[:12]:
+        if time.time() - start_time > GLOBAL_TIMEOUT_SECONDS:
+            logger.warning("[Timer] 14-minute safety execution budget reached. Halting discovery to ensure database persistence within 15 minutes.")
+            timed_out = True
+            break
+
         cat_label = category_labels.get(cat_slug, cat_slug.replace("-", " ").title())
         cat_vendors = vendors_by_category.get(cat_slug, [])
         queries = get_gem_queries_for_category(cat_slug, cat_label, cat_vendors)
@@ -148,6 +159,11 @@ def run_scraper(dry_run: bool = False):
         effective_queries.extend(queries)
 
         for kw in effective_queries[:4]:
+            if time.time() - start_time > GLOBAL_TIMEOUT_SECONDS:
+                logger.warning("[Timer] 14-minute safety execution budget reached inside keyword loop.")
+                timed_out = True
+                break
+
             try:
                 kw_bids = portal_client.scrape_keyword_tenders(
                     keyword=kw,
@@ -173,24 +189,27 @@ def run_scraper(dry_run: bool = False):
                 logger.warning(f"Error mining GeM category '{cat_slug}' keyword '{kw}': {e}")
 
     # Step 3: General Latest All-Bids Sweep (catches broad multi-item tenders)
-    logger.info("\n--- Phase 2: General Latest GeM All-Bids Sweep ---")
-    try:
-        general_bids = portal_client.fetch_all_bids_ajax(keyword="", page=1)
-        for b in general_bids:
-            bid_id = b.get("bid_id")
-            if not bid_id:
-                continue
-            if not b.get("matched_category_slug"):
-                inferred_cat = classify_tender(b)
-                if inferred_cat:
-                    b["matched_category_slug"] = inferred_cat
-            cat_slug = b.get("matched_category_slug")
-            if cat_slug:
-                tenders_by_category[cat_slug][bid_id] = b
-            if bid_id not in all_tenders_by_id:
-                all_tenders_by_id[bid_id] = b
-    except Exception as e:
-        logger.warning(f"General all-bids sweep warning: {e}")
+    if not timed_out and (time.time() - start_time < GLOBAL_TIMEOUT_SECONDS):
+        logger.info("\n--- Phase 2: General Latest GeM All-Bids Sweep ---")
+        try:
+            general_bids = portal_client.fetch_all_bids_ajax(keyword="", page=1)
+            for b in general_bids:
+                bid_id = b.get("bid_id")
+                if not bid_id:
+                    continue
+                if not b.get("matched_category_slug"):
+                    inferred_cat = classify_tender(b)
+                    if inferred_cat:
+                        b["matched_category_slug"] = inferred_cat
+                cat_slug = b.get("matched_category_slug")
+                if cat_slug:
+                    tenders_by_category[cat_slug][bid_id] = b
+                if bid_id not in all_tenders_by_id:
+                    all_tenders_by_id[bid_id] = b
+        except Exception as e:
+            logger.warning(f"General all-bids sweep warning: {e}")
+    else:
+        logger.info("\n--- Skipping Phase 2 to ensure timely persistence within 15 minutes ---")
 
     total_tenders = list(all_tenders_by_id.values())
     logger.info(f"\n[+] Total unique live GeM procurement tenders collected: {len(total_tenders)}")
@@ -209,9 +228,10 @@ def run_scraper(dry_run: bool = False):
         return
 
     # Step 4: Sync Shared Category Pools (`__category__:<slug>`) & Subscribed Category Vendors
-    logger.info("\n--- Phase 3: Category Pool & Subscribed Vendor Sync ---")
+    logger.info("\n--- Phase 3: Category Pool & Subscribed Vendor Sync (Firestore & COMBLOPEZ) ---")
     total_synced = 0
     total_pruned = 0
+    total_comblopez_synced = 0
 
     for cat_slug, bid_map in tenders_by_category.items():
         pool_tenders = list(bid_map.values())
@@ -228,6 +248,14 @@ def run_scraper(dry_run: bool = False):
         total_synced += res.get("synced", 0)
         total_pruned += res.get("pruned", 0)
 
+        comb_count = sync_manager.sync_to_comblopez(
+            target_key=pool_doc_id,
+            tenders=pool_tenders,
+            category_slug=cat_slug,
+            category_label=cat_label,
+        )
+        total_comblopez_synced += comb_count
+
     for vendor in vendors:
         vendor_id = vendor.get("vendor_id")
         if not vendor_id:
@@ -235,6 +263,7 @@ def run_scraper(dry_run: bool = False):
         c_slug = vendor.get("category_slug") or "general-marketplace"
         c_label = vendor.get("category_label") or "General Marketplace"
         business_name = vendor.get("business_name") or vendor.get("email") or vendor_id
+        vendor_email = str(vendor.get("email") or "").strip().lower()
 
         # Combine category pool tenders + general sweep matching this category for vendor-specific address scoring
         candidate_pool = list(tenders_by_category.get(c_slug, {}).values())
@@ -257,12 +286,34 @@ def run_scraper(dry_run: bool = False):
         total_synced += res.get("synced", 0)
         total_pruned += res.get("pruned", 0)
 
+        # Sync to COMBLOPEZ scraped_leads under vendor_id
+        comb_count1 = sync_manager.sync_to_comblopez(
+            target_key=str(vendor_id),
+            tenders=matched_tenders,
+            category_slug=c_slug,
+            category_label=c_label,
+        )
+        total_comblopez_synced += comb_count1
 
+        # Also sync under vendor_email if present and distinct (for instant dashboard email lookup)
+        if vendor_email and vendor_email != str(vendor_id).lower():
+            comb_count2 = sync_manager.sync_to_comblopez(
+                target_key=vendor_email,
+                tenders=matched_tenders,
+                category_slug=c_slug,
+                category_label=c_label,
+            )
+            total_comblopez_synced += comb_count2
+
+    elapsed_seconds = int(time.time() - start_time)
     logger.info("=" * 68)
-    logger.info("GeM AI Lead Finder Scraper Job Completed Successfully!")
+    logger.info(f"GeM AI Lead Finder Scraper Job Completed in {elapsed_seconds // 60}m {elapsed_seconds % 60}s!")
     logger.info(f"Unique Live Tenders Extracted : {len(total_tenders)}")
     logger.info(f"Category Pools Updated        : {len(tenders_by_category)}")
-    logger.info(f"Total Inquiry Records Synced  : {total_synced}")
+    logger.info(f"Firestore Inquiries Synced    : {total_synced}")
+    logger.info(f"COMBLOPEZ Leads Synced        : {total_comblopez_synced}")
+    logger.info(f"Expired Tenders Auto-Pruned   : {total_pruned}")
+    logger.info("=" * 68)
     logger.info(f"Expired Tenders Auto-Pruned   : {total_pruned}")
     logger.info("=" * 68)
 

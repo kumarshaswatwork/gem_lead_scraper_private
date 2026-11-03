@@ -16,7 +16,7 @@ jobs:
   scrape-and-sync:
     name: Scrape GeM Bids & Sync Category Pools + Vendor Feeds
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
@@ -38,6 +38,8 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
           ZIVIC_BASE_URL: ${{ secrets.ZIVIC_BASE_URL }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+          COMBLOPEZ_SUPABASE_PROJECT2_URL: ${{ secrets.COMBLOPEZ_SUPABASE_PROJECT2_URL }}
+          COMBLOPEZ_SUPABASE_PROJECT2_SERVICE_ROLE_KEY: ${{ secrets.COMBLOPEZ_SUPABASE_PROJECT2_SERVICE_ROLE_KEY }}
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SENSHRADDHA_SUPABASE_PROJECT2_URL: ${{ secrets.SENSHRADDHA_SUPABASE_PROJECT2_URL }}

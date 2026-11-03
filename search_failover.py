@@ -168,44 +168,110 @@ def search_google_cse(query: str) -> Optional[List[Dict[str, str]]]:
     return None
 
 
+def search_duckduckgo(query: str) -> Optional[List[Dict[str, str]]]:
+    """Free zero-key HTML search fallback via DuckDuckGo HTML endpoint."""
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        res = requests.post(url, data={"q": query, "kl": "in-en"}, headers=headers, timeout=12)
+        if res.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(res.text, "html.parser")
+            results = []
+            for r in soup.select(".result"):
+                a = r.select_one(".result__title a")
+                s = r.select_one(".result__snippet")
+                if a and a.get("href"):
+                    href = a["href"]
+                    if "uddg=" in href:
+                        import urllib.parse
+                        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                        href = parsed.get("uddg", [href])[0]
+                    results.append({
+                        "title": a.get_text(strip=True),
+                        "link": href,
+                        "snippet": s.get_text(strip=True) if s else "",
+                    })
+            if results:
+                return results
+    except Exception as e:
+        logger.debug(f"DuckDuckGo search fallback: {e}")
+    return None
+
+
 def search_gem_failover(
     keyword: str,
     category_slug: Optional[str] = None,
     location_hint: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Executes Serper-Free-Tier-safe search failover for official GeM tenders.
+    Executes multi-source search failover for government procurement tenders across:
+    1. GeM portal showbidDocument (official bids)
+    2. Tender Aggregators (avsar.app, tenders.infralens.in / BidEasy, tenderkart.in)
+    3. State eProcurement & CPPP (etender.up.nic.in, eprocure.gov.in)
     """
     current_year = datetime.now(timezone.utc).year
     loc_clause = f' "{location_hint}"' if location_hint else ""
-    query = f'showbidDocument "{keyword}"{loc_clause} GeM ("GEM/{current_year}" OR "Bid")'
-    logger.info(f"Running GeM search failover: {query}")
 
-    raw_results = (
-        search_serperdev(query)
-        or search_google_cse(query)
-        or search_scraperapi(query)
-        or search_apify(query)
-        or []
-    )
+    # Build multi-source queries targeting GeM, aggregators, and state portals
+    queries = [
+        f'showbidDocument "{keyword}"{loc_clause} GeM ("GEM/{current_year}" OR "Bid")',
+        f'"{keyword}" (site:avsar.app OR site:tenders.infralens.in OR site:tenderkart.in OR "BidEasy") ("GEM" OR "Tender") {location_hint or ""}',
+        f'"{keyword}" (site:etender.up.nic.in OR site:eprocure.gov.in) ("Tender" OR "Notice") {location_hint or "Uttar Pradesh"}',
+    ]
+
+    all_raw_results: List[Dict[str, str]] = []
+    seen_links = set()
+
+    for q in queries:
+        logger.info(f"Running government procurement search: {q}")
+        res = (
+            search_serperdev(q)
+            or search_google_cse(q)
+            or search_scraperapi(q)
+            or search_duckduckgo(q)
+            or search_apify(q)
+            or []
+        )
+        for item in res:
+            link = (item.get("link") or "").strip()
+            if link and link not in seen_links:
+                seen_links.add(link)
+                all_raw_results.append(item)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     tenders: List[Dict[str, Any]] = []
     seen_ids = set()
 
-    for r in raw_results:
+    for r in all_raw_results:
         title = (r.get("title") or "").strip()
         snippet = (r.get("snippet") or "").strip()
         link = (r.get("link") or "").strip()
-        full_text = f"{title} {snippet}"
+        full_text = f"{title} {snippet} {link}"
 
+        # 1. Detect bid number
         bid_no_match = re.search(r"GEM/\d{4}/[BR]/\d+", full_text)
         bid_number = bid_no_match.group(0) if bid_no_match else None
 
         doc_num_match = re.search(r"showbidDocument/([A-Za-z0-9_]+)", link)
+        if not bid_number and doc_num_match:
+            bid_number = f"GEM/{current_year}/B/{doc_num_match.group(1)}"
+
+        # If not a standard GeM ID, check for aggregator / eProcure tender ID
         if not bid_number:
-            if doc_num_match:
-                bid_number = f"GEM/{current_year}/B/{doc_num_match.group(1)}"
+            agg_id_match = re.search(r"(?:tender[s]?/|id=|bid[-_]?id=)([A-Za-z0-9_\-\/]{6,30})", link, re.IGNORECASE)
+            if agg_id_match:
+                bid_number = f"TENDER/{current_year}/{agg_id_match.group(1).replace('/', '_')}"
+            elif any(domain in link.lower() for domain in ["etender.up.nic.in", "eprocure.gov.in", "avsar.app", "infralens.in", "tenderkart.in"]):
+                import hashlib
+                h = hashlib.md5(link.encode()).hexdigest()[:8].upper()
+                bid_number = f"GOV/{current_year}/BID/{h}"
             else:
                 continue
 
@@ -218,34 +284,68 @@ def search_gem_failover(
             continue
 
         seen_ids.add(bid_id)
+
+        # 2. Extract Organization / Department
         dept_match = re.search(
-            r"(?:Ministry of [A-Za-z &]+|Department of [A-Za-z &]+|AIIMS|DRDO|ISRO|NTPC|BHEL|Indian Railways|Municipal Corporation [A-Za-z ]*)",
+            r"(?:HAL|IIM|IIT|DFCCIL|IOCL|Indian Oil|Indian Railways|Defence|Military Affairs|Air Force|Navy|Army|Medical Education|CPWD|MES|PWD|Jal Nigam|UPPCB|Pollution Control|Municipal Corporation|Nagar Nigam|AIIMS|SGPGI|KGMU|RMLIMS|Ministry of [A-Za-z &]+|Department of [A-Za-z &]+|DRDO|ISRO|NTPC|BHEL|SAIL)",
             full_text,
             re.IGNORECASE,
         )
         department = dept_match.group(0).strip() if dept_match else "Government Department / PSU"
         state, city = detect_indian_location(full_text)
 
-        doc_url = (
-            link
-            if "bidplus.gem.gov.in/showbidDocument" in link
-            else (
-                f"https://bidplus.gem.gov.in/showbidDocument/{doc_num_match.group(1)}"
-                if doc_num_match
-                else f"https://bidplus.gem.gov.in/showbidDocument/{bid_id}"
-            )
-        )
+        # 3. Detect financial metrics (Tender Value & EMD)
+        val_match = re.search(r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?\s*(?:lakh|crore|cr|k)?)", full_text, re.IGNORECASE)
+        tender_val = val_match.group(0).strip() if val_match else None
 
-        clean_title = re.sub(r"\s*\|\s*GeM.*$", "", title, flags=re.IGNORECASE).strip()
-        if not clean_title or clean_title.lower().startswith("bid document"):
-            clean_title = f"GeM Procurement Tender — {keyword.title()} ({bid_number})"
+        emd_match = re.search(r"EMD\s*(?:amount)?\s*:?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+)", full_text, re.IGNORECASE)
+        emd_val = f"₹{emd_match.group(1)}" if emd_match else None
+
+        # 4. Resolve source and doc URL
+        source_label = "Government e-Marketplace (GeM)"
+        if "avsar.app" in link:
+            source_label = "Avsar (GeM & Govt Procurement)"
+        elif "infralens.in" in link or "bideasy" in link:
+            source_label = "BidEasy / InfraLens (Tender Radar)"
+        elif "tenderkart.in" in link:
+            source_label = "Tenderkart (Govt Tenders)"
+        elif "etender.up.nic.in" in link:
+            source_label = "Uttar Pradesh e-Procurement (etender.up.nic.in)"
+        elif "eprocure.gov.in" in link:
+            source_label = "Central Public Procurement Portal (CPPP)"
+
+        doc_url = link
+        if "bidplus.gem.gov.in/showbidDocument" in link:
+            doc_url = link
+        elif doc_num_match:
+            doc_url = f"https://bidplus.gem.gov.in/showbidDocument/{doc_num_match.group(1)}"
+
+        # 5. Extract clean descriptive work title
+        clean_title = re.sub(r"\s*\|\s*(?:GeM|Avsar|BidEasy|Tenderkart|InfraLens).*$", "", title, flags=re.IGNORECASE).strip()
+        is_generic_title = (
+            not clean_title
+            or "बड" in clean_title
+            or "bid number" in clean_title.lower()
+            or clean_title.lower().startswith("bid document")
+            or len(clean_title) < 10
+        )
+        if is_generic_title:
+            work_match = re.search(
+                r"(?:Operation and Maintenance of [^;,\.\n]+|Sewage / Effluent Treatment Plant|Sewage Treatment Plant[^;,\.\n]*|Effluent Treatment Plant[^;,\.\n]*|PSA Oxygen [^;,\.\n]*|Oxygen Plant[^;,\.\n]*|AMC of [^;,\.\n]+|Supply and Installation of [^;,\.\n]+)",
+                snippet,
+                re.IGNORECASE,
+            )
+            if work_match:
+                clean_title = f"{work_match.group(0).strip()} ({bid_number})"
+            else:
+                clean_title = f"Government Procurement Tender — {keyword.title()} ({bid_number})"
 
         tenders.append({
             "bid_id": bid_id,
             "bid_number": bid_number,
             "title": clean_title[:200],
             "category_code": "gem-services",
-            "category_name": f"GeM {keyword.title()}",
+            "category_name": f"Government {keyword.title()}",
             "matched_category_slug": category_slug,
             "department": department[:150],
             "quantity": 1,
@@ -255,14 +355,19 @@ def search_gem_failover(
             "discovered_at": now_iso,
             "expiry_date": expiry_iso,
             "status": "ACTIVE",
-            "match_score": 78,
+            "match_score": 85 if (state == "Uttar Pradesh" or city == "Lucknow") else 75,
             "doc_url": doc_url,
+            "source": source_label,
+            "tender_value": tender_val,
+            "emd": emd_val,
             "raw_details": {
-                "source": "search_failover",
-                "snippet": snippet[:300],
+                "source": source_label,
+                "snippet": snippet[:350],
                 "link": link,
+                "tender_value": tender_val,
+                "emd": emd_val,
             },
         })
 
-    logger.info(f"Search failover extracted {len(tenders)} active tenders for '{keyword}'")
+    logger.info(f"Government search failover extracted {len(tenders)} active tenders for '{keyword}'")
     return tenders

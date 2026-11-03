@@ -12,6 +12,7 @@ import os
 import re
 import json
 import logging
+import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import requests
@@ -93,7 +94,7 @@ CANONICAL_CATEGORY_BUCKETS: List[Dict[str, Any]] = [
         "slug": "medical-oxygen-equipment",
         "label": "Medical Oxygen & Hospital Equipment",
         "keywords": ["oxygen plant", "psa plant", "psa", "oxyygen", "medical oxygen", "oxygen concentrator", "medical gas pipeline", "mgps", "hospital equipment"],
-        "gem_queries": ["Oxygen Plant", "Oxygen Concentrator", "Medical Gas Pipeline"],
+        "gem_queries": ["Oxygen Plant", "PSA Oxygen", "Oxygen Generator", "Oxygen Concentrator", "Medical Gas Pipeline", "Liquid Medical Oxygen"],
     },
     {
         "slug": "water-treatment-etp-stp",
@@ -104,7 +105,10 @@ CANONICAL_CATEGORY_BUCKETS: List[Dict[str, Any]] = [
             "water treatment plant", "ro plant", "dm plant",
             "water purification", "water quality", "pollution control",
         ],
-        "gem_queries": ["Water Treatment", "Effluent Treatment", "Sewage Treatment", "RO Plant"],
+        "gem_queries": [
+            "Sewage Treatment", "Effluent Treatment", "Water Treatment", "STP", "ETP",
+            "Operation and Maintenance of Effluent", "Effluent/Sewage Treatment Plant", "RO Plant"
+        ],
     },
     {
         "slug": "heavy-engineering-machinery",
@@ -558,6 +562,142 @@ class FirebaseSyncManager:
     def sync_vendor_inquiries(self, vendor_id: str, new_inquiries: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Backwards-compatible alias for `sync_target_inquiries`."""
         return self.sync_target_inquiries(vendor_id, new_inquiries)
+
+    def sync_to_comblopez(
+        self,
+        target_key: str,
+        tenders: List[Dict[str, Any]],
+        category_slug: Optional[str] = None,
+        category_label: Optional[str] = None,
+    ) -> int:
+        """
+        Syncs live government procurement tenders into COMBLOPEZ `scraped_leads` table,
+        so that vendors instantly view live tenders in their Zivic Nexus dashboard
+        (`zivicnexus.com/yourbusiness/dashboard`) under 'Live AI Lead Finder'.
+        """
+        comblopez_url = os.environ.get("COMBLOPEZ_SUPABASE_PROJECT2_URL", "").rstrip("/")
+        comblopez_key = os.environ.get("COMBLOPEZ_SUPABASE_PROJECT2_SERVICE_ROLE_KEY", "").strip()
+        if not comblopez_url or not comblopez_key or not tenders:
+            return 0
+
+        headers = {
+            "apikey": comblopez_key,
+            "Authorization": f"Bearer {comblopez_key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        encoded_key = urllib.parse.quote(target_key)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1. Fetch existing leads for this target key to preserve earliest discovered_at
+        existing_leads = []
+        try:
+            get_res = requests.get(
+                f"{comblopez_url}/rest/v1/scraped_leads?select=metadata&email=eq.{encoded_key}",
+                headers=headers,
+                timeout=12,
+            )
+            if get_res.status_code == 200:
+                data = get_res.json()
+                if data and len(data) > 0:
+                    raw_existing = data[0].get("metadata", {}).get("leads", [])
+                    for l in raw_existing:
+                        if isinstance(l, dict):
+                            existing_leads.append(l)
+        except Exception as e:
+            logger.warning(f"[COMBLOPEZ] Could not fetch existing leads for {target_key}: {e}")
+
+        # 2. Format tenders into standard COMBLOPEZ leads
+        new_formatted_leads = []
+        for t in tenders:
+            bid_id = t.get("bid_id") or t.get("bid_number") or ""
+            bid_no = t.get("bid_number") or bid_id
+            title = t.get("title") or f"Government Procurement Tender — {bid_no}"
+            dept = t.get("department") or "Government Department / PSU"
+            city = t.get("city") or ""
+            state = t.get("state") or "India"
+            loc = f"{city}, {state}".strip(", ") if city else state
+            score = t.get("match_score", 85)
+            doc_url = t.get("doc_url") or f"https://bidplus.gem.gov.in/showbidDocument/{bid_id}"
+            expiry = t.get("expiry_date") or ""
+            source = t.get("source") or "Government e-Marketplace (GeM)"
+
+            lead_item = {
+                "name": f"{title} ({bid_no})",
+                "title": title,
+                "social_url": doc_url,
+                "score": score,
+                "status": "high_confidence",
+                "category_slug": category_slug or t.get("matched_category_slug") or "general-marketplace",
+                "category_label": category_label or t.get("category_name") or "Government Tenders",
+                "source": source,
+                "author": dept,
+                "location": loc,
+                "city": city,
+                "state": state,
+                "discovered_at": t.get("discovered_at") or t.get("found_date") or now_iso,
+                "post_date": t.get("found_date") or now_iso,
+                "expiry_date": expiry,
+                "matched_intent": f"Govt Tender: {title[:90]} | Closes: {expiry[:10] if expiry else 'Open'}",
+                "contacts": f"Department: {dept} | Bid: {bid_no}",
+                "raw_details": t,
+            }
+            new_formatted_leads.append(lead_item)
+
+        # 3. Deduplicate by social_url / bid_number, preserving earliest discovered_at
+        merged_by_key = {}
+        for l in existing_leads + new_formatted_leads:
+            u = (l.get("social_url") or "").strip().lower()
+            bid_key = (l.get("raw_details", {}).get("bid_number") or "").strip().lower()
+            lead_key = bid_key or u
+            if not lead_key:
+                continue
+
+            if lead_key not in merged_by_key:
+                merged_by_key[lead_key] = dict(l)
+            else:
+                prev = merged_by_key[lead_key]
+                earliest_disc = prev.get("discovered_at") or l.get("discovered_at")
+                if prev.get("discovered_at") and l.get("discovered_at"):
+                    earliest_disc = min(prev["discovered_at"], l["discovered_at"])
+                winner = dict(l) if (l.get("score") or 0) >= (prev.get("score") or 0) else dict(prev)
+                winner["discovered_at"] = earliest_disc
+                merged_by_key[lead_key] = winner
+
+        all_leads = sorted(merged_by_key.values(), key=lambda x: x.get("score") or 0, reverse=True)
+
+        # 4. Upsert into COMBLOPEZ table `scraped_leads`
+        payload = {
+            "email": target_key,
+            "metadata": {
+                "leads": all_leads,
+                "category_slug": category_slug,
+                "category_label": category_label,
+                "is_government_source": True,
+                "last_updated": now_iso,
+            },
+            "status": "bundled",
+            "original_post_text": "Live Government Procurement & GeM Bids",
+            "source": "gem_government_radar",
+            "updated_at": now_iso,
+        }
+
+        try:
+            post_res = requests.post(
+                f"{comblopez_url}/rest/v1/scraped_leads?on_conflict=email",
+                headers=headers,
+                json=payload,
+                timeout=15,
+            )
+            if post_res.status_code in [200, 201, 204]:
+                logger.info(f"[COMBLOPEZ] Synced {len(all_leads)} government leads to '{target_key}'")
+                return len(all_leads)
+            else:
+                logger.warning(f"[COMBLOPEZ] Upsert returned HTTP {post_res.status_code}: {post_res.text[:150]}")
+        except Exception as e:
+            logger.error(f"[COMBLOPEZ] Upsert failed for '{target_key}': {e}")
+
+        return 0
 
     def prune_expired_inquiries(self, vendor_id: str) -> int:
         """Removes expired inquiries from `gem_vendor_feeds/{vendor_id}` where `expiry_date < now`."""
