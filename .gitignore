@@ -8,6 +8,8 @@ secrets/
 
 # Python artifacts
 __pycache__/
+.scraper_cache/
+.api_health.json
 *.py[cod]
 *$py.class
 *.so

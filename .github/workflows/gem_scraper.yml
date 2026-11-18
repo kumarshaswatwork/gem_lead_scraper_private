@@ -11,6 +11,26 @@ on:
         required: false
         type: boolean
         default: false
+      free_only:
+        description: 'Use ONLY free direct GeM/GePNIC/RSS channels (0 paid SERP credits)'
+        required: false
+        type: boolean
+        default: false
+      category:
+        description: 'Optional category filter override'
+        required: false
+        type: string
+        default: ''
+      location:
+        description: 'Optional location filter override (e.g. India, Uttar Pradesh, Maharashtra)'
+        required: false
+        type: string
+        default: ''
+      days:
+        description: 'Optional freshness window in days (e.g. 7 or 30)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   scrape-and-sync:
@@ -28,6 +48,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Restore Search Cache & Quota Ledger
+        uses: actions/cache@v4
+        with:
+          path: .scraper_cache
+          key: gem-lead-scraper-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gem-lead-scraper-cache-${{ runner.os }}-
+
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
@@ -35,6 +63,11 @@ jobs:
 
       - name: Run GeM AI Lead Scraper
         env:
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_FREE_ONLY: ${{ github.event.inputs.free_only }}
+          INPUT_CATEGORY: ${{ github.event.inputs.category }}
+          INPUT_LOCATION: ${{ github.event.inputs.location }}
+          INPUT_DAYS: ${{ github.event.inputs.days }}
           FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
           ZIVIC_BASE_URL: ${{ secrets.ZIVIC_BASE_URL }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
@@ -44,17 +77,36 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SENSHRADDHA_SUPABASE_PROJECT2_URL: ${{ secrets.SENSHRADDHA_SUPABASE_PROJECT2_URL }}
           SENSHRADDHA_SUPABASE_PROJECT2_SERVICE_ROLE_KEY: ${{ secrets.SENSHRADDHA_SUPABASE_PROJECT2_SERVICE_ROLE_KEY }}
-          SERPERDEV_API: ${{ secrets.SERPERDEV_API }}
-          SCRAPERAPI_KEYS: ${{ secrets.SCRAPERAPI_KEYS }}
-          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          KRSW_SUPABASE_URL: ${{ secrets.KRSW_SUPABASE_URL }}
+          KRSW_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.KRSW_SUPABASE_SERVICE_ROLE_KEY }}
+          AI_KEY_ENCRYPTION_SECRET: ${{ secrets.AI_KEY_ENCRYPTION_SECRET }}
+          TINYFISH_API_KEYS: ${{ secrets.TINYFISH_API_KEYS }}
+          GOOGLE_API_KEYS: ${{ secrets.GOOGLE_API_KEYS }}
           GOOGLE_KEYS: ${{ secrets.GOOGLE_KEYS }}
+          GOOGLE_CX_ID: ${{ secrets.GOOGLE_CX_ID }}
           GOOGLE_CX: ${{ secrets.GOOGLE_CX }}
+          SERPERDEV_API: ${{ secrets.SERPERDEV_API }}
+          BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+          EXA_API_KEYS: ${{ secrets.EXA_API_KEYS }}
+          LINKUP_API_KEYS: ${{ secrets.LINKUP_API_KEYS }}
+          FIRECRAWL_API_KEYS: ${{ secrets.FIRECRAWL_API_KEYS }}
+          LANGSEARCH_API_KEYS: ${{ secrets.LANGSEARCH_API_KEYS }}
+          SCRAPER_API_KEYS: ${{ secrets.SCRAPER_API_KEYS }}
+          SCRAPERAPI_KEYS: ${{ secrets.SCRAPERAPI_KEYS }}
+          SERPAPI_KEYS: ${{ secrets.SERPAPI_KEYS }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          DISABLE_PAID_SERP: ${{ secrets.DISABLE_PAID_SERP }}
+          SERPAPI_DAILY_CAP: ${{ secrets.SERPAPI_DAILY_CAP || '2' }}
+          SCRAPE_DAYS_WINDOW: ${{ secrets.SCRAPE_DAYS_WINDOW || '30' }}
         run: |
-          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            python gem_scraper.py --dry-run
-          else
-            python gem_scraper.py
-          fi
+          ARGS=()
+          if [ "${INPUT_DRY_RUN}" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "${INPUT_FREE_ONLY}" = "true" ]; then ARGS+=(--free-only); fi
+          if [ -n "${INPUT_CATEGORY}" ]; then ARGS+=(--category "${INPUT_CATEGORY}"); fi
+          if [ -n "${INPUT_LOCATION}" ]; then ARGS+=(--location "${INPUT_LOCATION}"); fi
+          if [ -n "${INPUT_DAYS}" ]; then ARGS+=(--days "${INPUT_DAYS}"); fi
+          python gem_scraper.py "${ARGS[@]}"
 
       - name: Trigger 30-Minute Staging Window & Admin Email Alert
         if: success() && github.event.inputs.dry_run != 'true'
