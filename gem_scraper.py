@@ -202,8 +202,9 @@ def discover_category_tenders(
 
     # Build GeM AJAX search list: clean service queries + crisp combined "<root_kw> <location>" queries when state/city targeted
     gem_queries = list(queries[:4])
+    t_state_target, t_city = detect_indian_location(primary_loc or "India")
     if primary_loc and primary_loc.lower() not in ("india", "pan india", "pan-india"):
-        t_st, t_city = detect_indian_location(primary_loc)
+        t_st = t_state_target
         loc_suffix = t_st if t_st != "National / Central" else primary_loc
         q0 = queries[0] if queries else category_label
         q0_low = q0.lower()
@@ -255,6 +256,8 @@ def discover_category_tenders(
                 _, loc_suf = _split_combined_keyword_location(kw)
                 kw_dept = b.get("department", "") if loc_suf else ""
                 if inferred_cat != category_slug and not tender_matches_keyword(t_title, kw_dept, kw):
+                    continue
+                if t_state_target != "National / Central" and b.get("state") not in (t_state_target, "National / Central", "", None):
                     continue
                 if bid_id not in found:
                     found[bid_id] = b

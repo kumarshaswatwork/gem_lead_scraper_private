@@ -711,13 +711,23 @@ def get_gem_queries_for_category(
                     break
 
     if focus_queries:
-        combined_q: List[str] = list(focus_queries[:4])
-        seen_cq = {q.lower() for q in combined_q}
-        for q in queries:
-            if q.lower() not in seen_cq:
-                seen_cq.add(q.lower())
-                combined_q.append(q)
-        queries = combined_q
+        is_cli_synthetic = all(not v.get("vendor_id") for v in vendors_in_cat)
+        if is_cli_synthetic or not queries:
+            combined_q: List[str] = list(focus_queries[:4])
+            seen_cq = {q.lower() for q in combined_q}
+            for q in queries:
+                if q.lower() not in seen_cq:
+                    seen_cq.add(q.lower())
+                    combined_q.append(q)
+            queries = combined_q
+        else:
+            combined_q = list(queries[:4])
+            seen_cq = {q.lower() for q in combined_q}
+            for fq in focus_queries[:2]:
+                if fq.lower() not in seen_cq:
+                    seen_cq.add(fq.lower())
+                    combined_q.append(fq)
+            queries = combined_q
 
     for v in vendors_in_cat:
         for field in ["sub_niche", "niche"]:
@@ -962,7 +972,7 @@ class FirebaseSyncManager:
                 continue
 
             t_state = str(t.get("state") or "")
-            if has_specific_state and is_local_space and t_state not in (v_state, "National / Central", ""):
+            if has_specific_state and t_state not in (v_state, "National / Central", ""):
                 continue
 
             item_copy = dict(t)
@@ -1019,7 +1029,7 @@ class FirebaseSyncManager:
                             if isinstance(inq, dict) and (not inq.get("matched_category_slug") or inq.get("matched_category_slug") == category_slug)
                         }
 
-                merged_inquiries = dict(existing_inquiries)
+                merged_inquiries: Dict[str, Any] = {}
                 synced_count = 0
 
                 for inq in (new_inquiries or []):
@@ -1172,29 +1182,58 @@ class FirebaseSyncManager:
                 "discovered_at": t.get("discovered_at") or t.get("found_date") or now_iso,
                 "post_date": t.get("found_date") or now_iso,
                 "expiry_date": expiry,
+                "original_post_text": f"Official GeM Government Tender ({bid_no}) issued by {dept} ({loc}). Requirement: {title}. Closing Date: {expiry[:10] if expiry else 'Active'}.",
                 "matched_intent": f"Govt Tender: {title[:90]} | Closes: {expiry[:10] if expiry else 'Open'}",
                 "contacts": f"Department: {dept} | Bid: {bid_no}",
                 "raw_details": t,
             }
             new_formatted_leads.append(lead_item)
 
-        # 3. Deduplicate by social_url / bid_number, preserving earliest discovered_at
+        # 3. Preserve non-GeM AI web leads from existing_leads; for GeM tenders keep only active new_formatted_leads
+        #    while preserving earliest discovered_at from existing_leads.
+        existing_disc_by_key = {}
+        retained_non_gem_leads = []
+        for l in existing_leads:
+            u = (l.get("social_url") or "").strip().lower()
+            bid_key = (l.get("raw_details", {}).get("bid_number") or "").strip().lower()
+            lead_key = bid_key or u
+            if lead_key and l.get("discovered_at"):
+                existing_disc_by_key[lead_key] = l.get("discovered_at")
+            is_gov = (
+                bool(bid_key)
+                or "gem" in str(l.get("source") or "").lower()
+                or str(l.get("matched_intent") or "").startswith("Govt Tender:")
+                or "gem.gov.in" in u
+                or "eprocure.gov.in" in u
+                or "etenders.gov.in" in u
+                or ".nic.in" in u
+            )
+            if not is_gov:
+                retained_non_gem_leads.append(l)
+
         merged_by_key = {}
-        for l in existing_leads + new_formatted_leads:
+        for l in retained_non_gem_leads + new_formatted_leads:
             u = (l.get("social_url") or "").strip().lower()
             bid_key = (l.get("raw_details", {}).get("bid_number") or "").strip().lower()
             lead_key = bid_key or u
             if not lead_key:
                 continue
 
+            item_copy = dict(l)
+            prev_disc = existing_disc_by_key.get(lead_key)
+            if prev_disc and item_copy.get("discovered_at"):
+                item_copy["discovered_at"] = min(prev_disc, item_copy["discovered_at"])
+            elif prev_disc:
+                item_copy["discovered_at"] = prev_disc
+
             if lead_key not in merged_by_key:
-                merged_by_key[lead_key] = dict(l)
+                merged_by_key[lead_key] = item_copy
             else:
                 prev = merged_by_key[lead_key]
-                earliest_disc = prev.get("discovered_at") or l.get("discovered_at")
-                if prev.get("discovered_at") and l.get("discovered_at"):
-                    earliest_disc = min(prev["discovered_at"], l["discovered_at"])
-                winner = dict(l) if (l.get("score") or 0) >= (prev.get("score") or 0) else dict(prev)
+                earliest_disc = prev.get("discovered_at") or item_copy.get("discovered_at")
+                if prev.get("discovered_at") and item_copy.get("discovered_at"):
+                    earliest_disc = min(prev["discovered_at"], item_copy["discovered_at"])
+                winner = item_copy if (item_copy.get("score") or 0) >= (prev.get("score") or 0) else dict(prev)
                 winner["discovered_at"] = earliest_disc
                 merged_by_key[lead_key] = winner
 
