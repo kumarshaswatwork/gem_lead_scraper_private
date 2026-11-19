@@ -586,14 +586,6 @@ def run_scraper(
         total_synced += res.get("synced", 0)
         total_pruned += res.get("pruned", 0)
 
-        comb_count = sync_manager.sync_to_comblopez(
-            target_key=pool_doc_id,
-            tenders=pool_tenders,
-            category_slug=cat_slug,
-            category_label=cat_label,
-        )
-        total_comblopez_synced += comb_count
-
     for vendor in vendors:
         vendor_id = vendor.get("vendor_id")
         if not vendor_id:
@@ -601,7 +593,6 @@ def run_scraper(
         c_slug = vendor.get("category_slug") or "general-marketplace"
         c_label = vendor.get("category_label") or "General Marketplace"
         business_name = vendor.get("business_name") or vendor.get("email") or vendor_id
-        vendor_email = str(vendor.get("email") or "").strip().lower()
 
         # Combine category pool tenders + general sweep matching this category for vendor-specific address scoring
         candidate_pool = list(tenders_by_category.get(c_slug, {}).values())
@@ -614,7 +605,7 @@ def run_scraper(
         logger.info(
             f"Vendor '{business_name}' ({vendor_id}) [Category: {c_label}]: Matched {len(matched_tenders)} tenders."
         )
-        # Always sync for each vendor so that when a vendor updates niche, stale inquiries are purged even if 0 new tenders match today!
+        # Always sync for each vendor to Firestore gem_vendor_feeds (powers /gem Automated GeM Lead Generation exclusively)
         res = sync_manager.sync_target_inquiries(
             target_doc_id=vendor_id,
             new_inquiries=matched_tenders,
@@ -623,25 +614,6 @@ def run_scraper(
         )
         total_synced += res.get("synced", 0)
         total_pruned += res.get("pruned", 0)
-
-        # Sync to COMBLOPEZ scraped_leads under vendor_id
-        comb_count1 = sync_manager.sync_to_comblopez(
-            target_key=str(vendor_id),
-            tenders=matched_tenders,
-            category_slug=c_slug,
-            category_label=c_label,
-        )
-        total_comblopez_synced += comb_count1
-
-        # Also sync under vendor_email if present and distinct (for instant dashboard email lookup)
-        if vendor_email and vendor_email != str(vendor_id).lower():
-            comb_count2 = sync_manager.sync_to_comblopez(
-                target_key=vendor_email,
-                tenders=matched_tenders,
-                category_slug=c_slug,
-                category_label=c_label,
-            )
-            total_comblopez_synced += comb_count2
 
     elapsed_seconds = int(time.time() - start_time)
     logger.info("=" * 68)
