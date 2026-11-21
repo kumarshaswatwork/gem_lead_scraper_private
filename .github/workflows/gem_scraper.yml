@@ -99,6 +99,7 @@ jobs:
           DISABLE_PAID_SERP: ${{ secrets.DISABLE_PAID_SERP }}
           SERPAPI_DAILY_CAP: ${{ secrets.SERPAPI_DAILY_CAP || '2' }}
           SCRAPE_DAYS_WINDOW: ${{ secrets.SCRAPE_DAYS_WINDOW || '30' }}
+          STRICT_DIRECT_DB: "true"
         run: |
           ARGS=()
           if [ "${INPUT_DRY_RUN}" = "true" ]; then ARGS+=(--dry-run); fi
@@ -108,17 +109,14 @@ jobs:
           if [ -n "${INPUT_DAYS}" ]; then ARGS+=(--days "${INPUT_DAYS}"); fi
           python gem_scraper.py "${ARGS[@]}"
 
-      - name: Trigger 30-Minute Staging Window & Admin Email Alert
+      - name: Stage Leads & Send Admin Review Alert (Direct-to-DB, 0 Vercel)
         if: success() && github.event.inputs.dry_run != 'true'
         env:
-          ZIVIC_BASE_URL: ${{ secrets.ZIVIC_BASE_URL || 'https://zivicnexus.com' }}
-          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          COMBLOPEZ_SUPABASE_PROJECT2_URL: ${{ secrets.COMBLOPEZ_SUPABASE_PROJECT2_URL }}
+          COMBLOPEZ_SUPABASE_PROJECT2_SERVICE_ROLE_KEY: ${{ secrets.COMBLOPEZ_SUPABASE_PROJECT2_SERVICE_ROLE_KEY }}
+          AI_LEAD_SCRAPER_EMAIL_NOTFCN_URL: ${{ secrets.AI_LEAD_SCRAPER_EMAIL_NOTFCN_URL }}
+          AI_LEAD_SCRAPER_EMAIL_NOTFCN_KEY: ${{ secrets.AI_LEAD_SCRAPER_EMAIL_NOTFCN_KEY }}
+          TARGET_ADMIN_EMAIL: ${{ secrets.TARGET_ADMIN_EMAIL || 'zivicnexus@gmail.com' }}
+          PLATFORM_BASE_URL: ${{ secrets.ZIVIC_BASE_URL || 'https://zivicnexus.com' }}
         run: |
-          echo "Initiating 30-Minute GeM Staging & Admin Verification Alert..."
-          BASE_URL="${ZIVIC_BASE_URL:-https://zivicnexus.com}"
-          AUTH_TOKEN="${CRON_SECRET:-$SCRAPER_API_KEY}"
-          curl -s -X POST "${BASE_URL}/api/cron/stage-leads?minutes=30&source=gem_scraper_actions" \
-            -H "Authorization: Bearer ${AUTH_TOKEN}" \
-            -H "x-scraper-key: ${SCRAPER_API_KEY}" \
-            -H "Content-Type: application/json" || echo "Staging initiation completed or timed out"
+          python stage_leads_direct.py --minutes 30 --source gem_scraper_actions

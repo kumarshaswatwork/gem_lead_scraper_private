@@ -894,6 +894,13 @@ class FirebaseSyncManager:
             except Exception as e:
                 logger.error(f"Firestore query for subscribed vendors failed: {e}")
 
+        if os.getenv("STRICT_DIRECT_DB", "").strip().lower() in ("1", "true", "yes"):
+            logger.warning(
+                "[StrictDirectDB] Skipping Vercel API fallback (/api/gem/subscribed-vendors). "
+                "Verify FIREBASE_SERVICE_ACCOUNT_KEY is configured for direct Firestore access."
+            )
+            return []
+
         if self.api_base_url and self.scraper_api_key:
             try:
                 url = f"{self.api_base_url}/api/gem/subscribed-vendors"
@@ -1075,6 +1082,13 @@ class FirebaseSyncManager:
                 return {"synced": synced_count, "pruned": pruned}
             except Exception as e:
                 logger.error(f"Firestore update failed for '{target_doc_id}': {e}")
+
+        if os.getenv("STRICT_DIRECT_DB", "").strip().lower() in ("1", "true", "yes"):
+            logger.warning(
+                f"[StrictDirectDB] Skipping Vercel API fallback (/api/gem/sync-bids) for '{target_doc_id}'. "
+                "Verify FIREBASE_SERVICE_ACCOUNT_KEY is configured for direct Firestore writes."
+            )
+            return {"synced": 0, "pruned": 0}
 
         if self.api_base_url and self.scraper_api_key:
             try:
