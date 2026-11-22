@@ -338,6 +338,102 @@ def _run_unit_guards_body():
             qs_think = _fbs_mod._expand_gem_queries_with_ai("solar-water-pump-think", "Solar Water Pump", location_hint="India")
     assert qs_think == ["Solar Pump", "Water Pumping System"], f"Failed GeM AI <think> stripping: {qs_think}"
 
+    # 7. Round 5 Audit Guards:
+    #    - AI-expanded queries MUST NOT be truncated when synthesized queries already have 6 items (with location hint)
+    #    - _parse_service_account_json handles UTF-8 BOM, surrounding quotes, base64, and escaped \\n
+    #    - GemPortalClient circuit breaker trips after 3 consecutive timeouts and short-circuits further network calls
+    #    - stage_leads_direct counts GeM Firestore tenders (ignoring expired tenders & vendor docs)
+    import base64 as _b64, json as _json, requests as _requests
+    with _mock.patch.object(
+        _fbs_mod,
+        "_synthesize_dynamic_gem_queries",
+        return_value=["Term 1", "Term 2", "Term 3", "Term 4", "Term 5", "Term 6"],
+    ):
+        with _mock.patch.object(
+            _fbs_mod,
+            "_expand_gem_queries_with_ai",
+            return_value=["AI Term Alpha", "AI Term Beta", "AI Term Gamma"],
+        ):
+            merged_qs = get_gem_queries_for_category(
+                "unseen-industrial-widget",
+                "Unseen Industrial Widget",
+                [],
+                location_hint="Lucknow",
+                use_ai=True,
+            )
+    assert "AI Term Alpha" in merged_qs and "AI Term Beta" in merged_qs, f"AI queries were truncated! Got: {merged_qs}"
+
+    # Verify AI-expanded queries are ALSO preserved for REAL vendors (vendor_id present -> focus_queries branch)
+    with _mock.patch.object(
+        _fbs_mod,
+        "_synthesize_dynamic_gem_queries",
+        return_value=["Term 1", "Term 2", "Term 3", "Term 4", "Term 5", "Term 6"],
+    ):
+        with _mock.patch.object(
+            _fbs_mod,
+            "_expand_gem_queries_with_ai",
+            return_value=["AI Term Alpha", "AI Term Beta", "AI Term Gamma"],
+        ):
+            real_vendor_qs = get_gem_queries_for_category(
+                "unseen-industrial-widget",
+                "Unseen Industrial Widget",
+                [{"vendor_id": "v_real_1", "niche": "Pneumatic Air Dryer", "sub_niche": "Compressed Air Dryer Piping"}],
+                location_hint="Lucknow",
+                use_ai=True,
+            )
+    assert (
+        "AI Term Alpha" in real_vendor_qs
+        and "AI Term Beta" in real_vendor_qs
+        and "AI Term Gamma" in real_vendor_qs
+    ), f"AI queries were truncated on real-vendor focus branch! Got: {real_vendor_qs}"
+
+    sa_payload = _json.dumps({
+        "type": "service_account",
+        "project_id": "fir-80-72586",
+        "private_key": "-----BEGIN PRIVATE KEY-----\\nABC\\n-----END PRIVATE KEY-----\\n",
+        "client_email": "svc@fir-80-72586.iam.gserviceaccount.com",
+    })
+    for variant in [f"\ufeff{sa_payload}", f"'{sa_payload}'", _b64.b64encode(sa_payload.encode("utf-8")).decode("ascii")]:
+        parsed_sa = _fbs_mod._parse_service_account_json(variant)
+        assert parsed_sa["project_id"] == "fir-80-72586" and "\nABC\n" in parsed_sa["private_key"]
+
+    cb_client = GemPortalClient(timeout=1, max_consecutive_failures=3)
+    get_attempts = []
+    def _always_timeout(*a, **k):
+        get_attempts.append(1)
+        raise _requests.exceptions.ConnectTimeout("simulated US runner timeout to bidplus.gem.gov.in")
+    with _mock.patch.object(cb_client.session, "get", side_effect=_always_timeout):
+        for _ in range(10):
+            assert cb_client.scrape_keyword_tenders("Event Management", max_pages=1) == []
+    assert cb_client.circuit_open is True, "Circuit breaker failed to open after consecutive timeouts!"
+    assert len(get_attempts) == 3, f"Expected exactly 3 network attempts before circuit open, got {len(get_attempts)}"
+
+    import stage_leads_direct as _gem_stage
+    class _FakeDoc:
+        def __init__(self, doc_id, data):
+            self.id = doc_id
+            self._data = data
+        def to_dict(self):
+            return self._data
+    class _FakeCol:
+        def stream(self):
+            return [
+                _FakeDoc("vendor_123", {"inquiries": {"V1": {"expiry_date": "2099-01-01T00:00:00Z"}}}),
+                _FakeDoc("__category__:saree-apparel", {"inquiries": {
+                    "ACTIVE_1": {"expiry_date": "2099-01-01T00:00:00Z"},
+                    "EXPIRED_1": {"expiry_date": "2020-01-01T00:00:00Z"},
+                }}),
+                _FakeDoc("__category__:coaching", {"inquiries": {
+                    "ACTIVE_2": {"expiry_date": "2099-06-01T00:00:00Z"},
+                }}),
+            ]
+    class _FakeDb:
+        def collection(self, name):
+            assert name == "gem_vendor_feeds"
+            return _FakeCol()
+    gem_cnt, gem_cats = _gem_stage.scan_gem_firestore_category_pools(db=_FakeDb())
+    assert (gem_cnt, gem_cats) == (2, 2), f"Expected (2, 2) active GeM Firestore tenders, got {(gem_cnt, gem_cats)}"
+
     print("  [+] All GeM anti-false-positive, GePNIC, quota & dynamic location unit guards passed!")
 
 

@@ -12,6 +12,7 @@ import os
 import re
 import json
 import time
+import base64
 import hashlib
 import logging
 import urllib.parse
@@ -686,11 +687,26 @@ def get_gem_queries_for_category(
                     queries.append(q)
 
     if not queries and category_slug != "general-marketplace":
-        queries.extend(_synthesize_dynamic_gem_queries(category_slug, category_label, vendors_in_cat, location_hint=location_hint))
-        if use_ai:
-            for ai_q in _expand_gem_queries_with_ai(category_slug, category_label, location_hint=location_hint):
-                if ai_q and ai_q.lower() not in {q.lower() for q in queries}:
-                    queries.append(ai_q)
+        synth_queries = _synthesize_dynamic_gem_queries(
+            category_slug, category_label, vendors_in_cat, location_hint=location_hint
+        )
+        ai_queries = (
+            _expand_gem_queries_with_ai(category_slug, category_label, location_hint=location_hint)
+            if use_ai
+            else []
+        )
+        if ai_queries:
+            # Prioritize top synthesized terms + AI-expanded GeM terms so AI queries are NEVER truncated by list slice
+            merged_dynamic: List[str] = []
+            seen_dyn = set()
+            for q in list(synth_queries[:3]) + list(ai_queries) + list(synth_queries[3:]):
+                clean_q = str(q or "").strip()
+                if clean_q and clean_q.lower() not in seen_dyn:
+                    seen_dyn.add(clean_q.lower())
+                    merged_dynamic.append(clean_q)
+            queries.extend(merged_dynamic)
+        else:
+            queries.extend(synth_queries)
 
     # If a specific sub-niche/focus (e.g. 'Dentist Clinic' or 'Security Guard Services') maps into a broad
     # bucket whose default queries don't cover that sub-niche, synthesize & prioritize sub-niche queries FIRST.
@@ -727,6 +743,10 @@ def get_gem_queries_for_category(
                 if fq.lower() not in seen_cq:
                     seen_cq.add(fq.lower())
                     combined_q.append(fq)
+            for q in queries[4:]:
+                if q.lower() not in seen_cq:
+                    seen_cq.add(q.lower())
+                    combined_q.append(q)
             queries = combined_q
 
     for v in vendors_in_cat:
@@ -736,7 +756,58 @@ def get_gem_queries_for_category(
                 if val.lower() not in {q.lower() for q in queries}:
                     queries.append(val)
 
-    return queries[:6] if queries else ["Event Management", "Chartered Accountant", "Catering"]
+    return queries[:8] if queries else ["Event Management", "Chartered Accountant", "Catering"]
+
+
+def _parse_service_account_json(raw_value: str) -> Dict[str, Any]:
+    """
+    Parses FIREBASE_SERVICE_ACCOUNT_KEY safely even when wrapped in extra quotes,
+    prefixed with UTF-8 BOM, base64-encoded, or containing escaped \\n newlines.
+    """
+    cleaned = (raw_value or "").lstrip("\ufeff").strip()
+    if not cleaned:
+        raise ValueError("Empty FIREBASE_SERVICE_ACCOUNT_KEY value")
+
+    if (
+        (cleaned.startswith("'") and cleaned.endswith("'"))
+        or (cleaned.startswith('"') and cleaned.endswith('"') and not cleaned.startswith('{"'))
+    ):
+        cleaned = cleaned[1:-1].strip()
+
+    parsed: Any = None
+    last_err: Optional[Exception] = None
+    for candidate in (cleaned,):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, str):
+                obj = json.loads(obj)
+            parsed = obj
+            break
+        except Exception as e:
+            last_err = e
+            try:
+                obj = json.loads(candidate, strict=False)
+                if isinstance(obj, str):
+                    obj = json.loads(obj, strict=False)
+                parsed = obj
+                break
+            except Exception as e2:
+                last_err = e2
+
+    if parsed is None and not cleaned.startswith("{"):
+        try:
+            decoded = base64.b64decode(cleaned).decode("utf-8").lstrip("\ufeff").strip()
+            parsed = json.loads(decoded, strict=False)
+        except Exception as e3:
+            last_err = e3
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid service account JSON payload: {last_err}")
+
+    if isinstance(parsed.get("private_key"), str) and "\\n" in parsed["private_key"]:
+        parsed["private_key"] = parsed["private_key"].replace("\\n", "\n")
+
+    return parsed
 
 
 class FirebaseSyncManager:
@@ -772,7 +843,7 @@ class FirebaseSyncManager:
             raw_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_KEY") or os.environ.get("FIREBASE_GEM_SERVICE_ACCOUNT_KEY")
             if raw_json:
                 try:
-                    cred = credentials.Certificate(json.loads(raw_json))
+                    cred = credentials.Certificate(_parse_service_account_json(raw_json))
                     logger.info("Loaded Firebase credentials from FIREBASE_SERVICE_ACCOUNT_KEY")
                 except Exception as e:
                     logger.error(f"Failed to parse FIREBASE_SERVICE_ACCOUNT_KEY JSON: {e}")

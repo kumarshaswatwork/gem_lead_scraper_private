@@ -3,6 +3,7 @@ GeM Portal Scraper Client (V2 — CSRF AJAX + Solr Array Unwrapping + HTML Fallb
 Extracts live ongoing procurement tenders from Government e-Marketplace (bidplus.gem.gov.in).
 """
 
+import os
 import re
 import json
 import time
@@ -545,12 +546,33 @@ def tender_matches_keyword(clean_title: str, department: str, keyword: str) -> b
 
 
 class GemPortalClient:
-    def __init__(self, timeout: int = 18):
+    def __init__(self, timeout: int = 18, max_consecutive_failures: Optional[int] = None):
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.csrf_token: Optional[str] = None
         self._csrf_fetched_at: float = 0.0
+        env_max = os.environ.get("GEM_PORTAL_MAX_CONSECUTIVE_FAILURES", "").strip()
+        default_max = int(env_max) if env_max.isdigit() and int(env_max) > 0 else 3
+        self.max_consecutive_failures = max(1, int(max_consecutive_failures or default_max))
+        self._consecutive_failures: int = 0
+        self.circuit_open: bool = False
+        self.circuit_reason: Optional[str] = None
+
+    def _record_network_success(self) -> None:
+        self._consecutive_failures = 0
+
+    def _record_network_failure(self, err: Exception) -> None:
+        if isinstance(err, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.max_consecutive_failures and not self.circuit_open:
+                self.circuit_open = True
+                self.circuit_reason = str(err)
+                logger.warning(
+                    f"[GeM CircuitBreaker] bidplus.gem.gov.in unreachable after {self._consecutive_failures} "
+                    f"consecutive network timeouts/errors ({err}). Fast-failing remaining direct GeM requests "
+                    "so GePNIC, Civic RSS, failover, and Firestore sync can proceed."
+                )
 
     def _parse_gem_date(self, date_val: Any) -> Optional[str]:
         """Converts GeM ISO or DD-MM-YYYY date strings to ISO 8601 UTC string."""
@@ -594,12 +616,15 @@ class GemPortalClient:
 
     def _ensure_csrf_token(self, force_refresh: bool = False) -> Optional[str]:
         """Initializes GeM session cookies & extracts `csrf_gem_cookie` / `csrf_bd_gem_nk`."""
+        if self.circuit_open:
+            return None
         now = time.time()
         if not force_refresh and self.csrf_token and (now - self._csrf_fetched_at) < 600:
             return self.csrf_token
 
         try:
             res = self.session.get(GEM_ALL_BIDS_URL, timeout=self.timeout)
+            self._record_network_success()
             cookie_tok = self.session.cookies.get("csrf_gem_cookie")
             if not cookie_tok and res.status_code == 200:
                 m = re.search(r"csrf_bd_gem_nk['\"]?\s*[:=]\s*['\"]([a-f0-9]+)['\"]", res.text)
@@ -611,6 +636,7 @@ class GemPortalClient:
                 self._csrf_fetched_at = now
                 return self.csrf_token
         except Exception as e:
+            self._record_network_failure(e)
             logger.warning(f"Failed to initialize GeM CSRF session: {e}")
 
         return None
@@ -626,6 +652,8 @@ class GemPortalClient:
         """
         Queries GeM's official `/all-bids-data` endpoint using form-encoded payload + CSRF token.
         """
+        if self.circuit_open:
+            return []
         csrf = self._ensure_csrf_token()
         if not csrf:
             return []
@@ -665,6 +693,7 @@ class GemPortalClient:
                     headers=post_headers,
                     timeout=self.timeout,
                 )
+                self._record_network_success()
 
                 if res.status_code == 403 and attempt == 0:
                     csrf = self._ensure_csrf_token(force_refresh=True)
@@ -801,7 +830,10 @@ class GemPortalClient:
                 )
                 return extracted
             except Exception as e:
+                self._record_network_failure(e)
                 logger.warning(f"GeM AJAX error (attempt {attempt + 1}) for '{keyword}': {e}")
+                if self.circuit_open:
+                    break
 
         return []
 
@@ -817,10 +849,14 @@ class GemPortalClient:
         Primary entry for general/page GeM bids: uses CSRF AJAX first (since bidplus.gem.gov.in
         is an AJAX SPA), then falls back to static HTML parsing if needed.
         """
+        if self.circuit_open:
+            return []
         if try_ajax:
             ajax_bids = self.fetch_all_bids_ajax(keyword=keyword or "", page=page, sort=sort, days_window=days_window)
             if ajax_bids:
                 return ajax_bids
+            if self.circuit_open:
+                return []
 
         params: Dict[str, Any] = {}
         if page > 1:
@@ -830,6 +866,7 @@ class GemPortalClient:
 
         try:
             response = self.session.get(GEM_ALL_BIDS_URL, params=params, timeout=self.timeout)
+            self._record_network_success()
             if response.status_code != 200:
                 return []
 
@@ -895,6 +932,7 @@ class GemPortalClient:
 
             return bids
         except Exception as e:
+            self._record_network_failure(e)
             logger.error(f"Error scraping GeM portal HTML: {e}")
             return []
 
@@ -907,8 +945,12 @@ class GemPortalClient:
         days_window: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Scrapes ongoing GeM bids matching `keyword` across up to `max_pages`."""
+        if self.circuit_open:
+            return []
         collected: Dict[str, Dict[str, Any]] = {}
         for p in range(1, max_pages + 1):
+            if self.circuit_open:
+                break
             batch = self.fetch_all_bids_ajax(
                 keyword=keyword,
                 page=p,
@@ -925,7 +967,7 @@ class GemPortalClient:
             if p < max_pages:
                 time.sleep(0.5)
 
-        if not collected:
+        if not collected and not self.circuit_open:
             for item in self.fetch_all_bids_html(page=1, keyword=keyword, sort=sort, days_window=days_window, try_ajax=False):
                 bid_id = item.get("bid_id")
                 if bid_id and bid_id not in collected:

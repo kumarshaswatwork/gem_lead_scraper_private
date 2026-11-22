@@ -200,8 +200,8 @@ def discover_category_tenders(
     )
     found: Dict[str, Dict[str, Any]] = {}
 
-    # Build GeM AJAX search list: clean service queries + crisp combined "<root_kw> <location>" queries when state/city targeted
-    gem_queries = list(queries[:4])
+    # Build GeM AJAX search list: clean service queries (including AI-expanded terms) + combined "<root_kw> <location>" queries
+    gem_queries = list(queries[:6])
     t_state_target, t_city = detect_indian_location(primary_loc or "India")
     if primary_loc and primary_loc.lower() not in ("india", "pan india", "pan-india"):
         t_st = t_state_target
@@ -235,7 +235,10 @@ def discover_category_tenders(
     )
 
     # 1. Free Direct GeM Portal AJAX (`Bid-Start-Date-Latest`)
-    for kw in gem_queries[:7]:
+    for kw in gem_queries[:8]:
+        if getattr(portal_client, "circuit_open", False):
+            logger.info(f"[GeM CircuitBreaker] Skipping direct GeM portal queries for '{category_slug}'; proceeding to GePNIC/RSS/Failover.")
+            break
         if start_time and (time.time() - start_time > global_timeout):
             break
         try:
@@ -269,7 +272,7 @@ def discover_category_tenders(
     if not (start_time and (time.time() - start_time > global_timeout)):
         try:
             gepnic_bids = fetch_gepnic_tenders_for_target(
-                keywords=queries[:4],
+                keywords=queries[:6],
                 category_slug=category_slug,
                 location_hint=primary_loc,
             )
@@ -341,6 +344,9 @@ def scrape_regional_sweep(
     sweep_kws = keywords or build_regional_sweep_keywords(location_hint)
     collected: Dict[str, Dict[str, Any]] = {}
     for kw in sweep_kws:
+        if getattr(portal_client, "circuit_open", False):
+            logger.info("[GeM CircuitBreaker] Exiting regional GeM sweep early so Phase 2 (GePNIC/RSS/Failover) & Firestore sync can run.")
+            break
         if start_time and (time.time() - start_time > global_timeout):
             break
         try:
@@ -406,6 +412,14 @@ def run_scraper(
     portal_client = GemPortalClient()
     sync_manager = FirebaseSyncManager()
 
+    strict_direct_db = os.environ.get("STRICT_DIRECT_DB", "").strip().lower() in ("1", "true", "yes")
+    if not dry_run and sync_manager.db is None and (strict_direct_db or not sync_manager.scraper_api_key):
+        logger.error(
+            "[CRITICAL] Direct Firestore client failed to initialize (check FIREBASE_SERVICE_ACCOUNT_KEY secret) "
+            "and no fallback sync transport is enabled. Aborting with non-zero exit code."
+        )
+        sys.exit(1)
+
     category_labels: Dict[str, str] = {
         b["slug"]: b["label"] for b in CANONICAL_CATEGORY_BUCKETS
     }
@@ -464,7 +478,7 @@ def run_scraper(
         if bid_id not in all_tenders_by_id:
             all_tenders_by_id[bid_id] = b
 
-    if time.time() - start_time < GLOBAL_TIMEOUT_SECONDS:
+    if time.time() - start_time < GLOBAL_TIMEOUT_SECONDS and not getattr(portal_client, "circuit_open", False):
         try:
             general_bids = portal_client.fetch_all_bids_ajax(
                 keyword="", page=1, sort="Bid-Start-Date-Latest", days_window=effective_days

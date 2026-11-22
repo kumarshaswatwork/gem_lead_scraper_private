@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-Direct-to-DB Lead Staging Controller (Zero-Vercel)
-==================================================
-Replaces `curl POST https://zivicnexus.com/api/cron/stage-leads` at the end of
-the AI Buyer Lead Scraper and GeM Tender Scraper GitHub Actions workflows.
+Direct-to-DB GeM Tender Lead Staging Controller (Manual / Zero-Vercel)
+======================================================================
+Note: Automated daily evening review (9:00 PM IST -> 9:00 AM IST next-morning delivery)
+is now consolidated into `ka-keepalive` (`evening-lead-review`) so admin receives
+at most ONE combined evening review email per day.
 
-What it does directly (0 Vercel calls):
-1. Scans COMBLOPEZ Supabase `scraped_leads` category pools (`__category__:%`)
-   to count fresh leads discovered in the last 48 hours.
-2. Upserts the `__lead_staging_batch__` row directly into COMBLOPEZ Supabase
-   with `status = "staged"` and `scheduled_delivery_at = now + <minutes>`.
-3. Sends the branded 30-minute review window alert email directly to admin
-   (`zivicnexus@gmail.com`) via Gmail SMTP using `AI_LEAD_SCRAPER_EMAIL_NOTFCN_URL`
-   and `AI_LEAD_SCRAPER_EMAIL_NOTFCN_KEY`.
+If invoked manually, this script:
+1. Counts active (non-expired) GeM tenders directly in Firestore `fir-80-72586`
+   (`gem_vendor_feeds` documents with `__category__:*` prefix) — NOT COMBLOPEZ commercial leads.
+2. Preserves existing `vendor_exclusions` when upserting `__lead_staging_batch__` in COMBLOPEZ.
+3. Schedules delivery for next morning 9:00 AM IST (unless `--minutes` is explicitly provided).
 
 Usage:
-  python stage_leads_direct.py --minutes 30 --source gem_scraper_actions [--dry-run]
+  python stage_leads_direct.py [--minutes 30] --source gem_scraper_manual [--dry-run]
 """
 
 import argparse
@@ -28,8 +26,11 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Tuple
 
 import requests
+
+from firebase_sync import FirebaseSyncManager
 
 STAGING_BATCH_KEY = "__lead_staging_batch__"
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
@@ -63,47 +64,89 @@ def get_env(key: str, default: str = "") -> str:
     return (os.environ.get(key) or default).strip()
 
 
-def scan_comblopez_category_pools(supabase_url: str, service_key: str) -> tuple[int, int]:
-    """Counts active categories and fresh leads (last 48h) directly in COMBLOPEZ."""
-    endpoint = (
-        f"{supabase_url.rstrip('/')}/rest/v1/scraped_leads"
-        "?select=email,metadata,updated_at&email=like.__category__:*"
-    )
+def compute_next_morning_9am_ist(now_utc: datetime) -> datetime:
+    """Computes the next 9:00 AM IST (03:30 UTC) strictly after `now_utc`."""
+    now_ist = now_utc.astimezone(IST_TZ)
+    candidate_ist = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+    if candidate_ist <= now_ist:
+        candidate_ist = candidate_ist + timedelta(days=1)
+    return candidate_ist.astimezone(timezone.utc)
+
+
+def scan_gem_firestore_category_pools(db=None) -> Tuple[int, int]:
+    """Counts active (non-expired) GeM tenders across `__category__:*` pools in Firestore `fir-80-72586`."""
+    if db is None:
+        sync_manager = FirebaseSyncManager()
+        db = sync_manager.db
+
+    if db is None:
+        print("[StageLeadsDirect] Warning: Firestore client unavailable; cannot count GeM tenders.")
+        return 0, 0
+
+    now_utc = datetime.now(timezone.utc)
+    total_tenders = 0
+    categories_count = 0
+
+    try:
+        docs = db.collection("gem_vendor_feeds").stream()
+        for doc in docs:
+            if not str(doc.id).startswith("__category__:"):
+                continue
+            data = doc.to_dict() or {}
+            inquiries = data.get("inquiries")
+            if not isinstance(inquiries, dict):
+                continue
+
+            cat_active = 0
+            for _, item in inquiries.items():
+                if not isinstance(item, dict):
+                    continue
+                expiry_raw = str(item.get("expiry_date") or item.get("expiry") or "").strip()
+                is_expired = False
+                if expiry_raw:
+                    try:
+                        exp_dt = datetime.fromisoformat(expiry_raw.replace("Z", "+00:00"))
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                        if exp_dt < now_utc:
+                            is_expired = True
+                    except Exception:
+                        pass
+                if not is_expired:
+                    cat_active += 1
+
+            if cat_active > 0:
+                categories_count += 1
+                total_tenders += cat_active
+    except Exception as exc:
+        print(f"[StageLeadsDirect] Warning scanning GeM Firestore pools: {exc}")
+        return 0, 0
+
+    return total_tenders, categories_count
+
+
+def fetch_existing_staging_metadata(supabase_url: str, service_key: str) -> dict:
+    """Reads existing `__lead_staging_batch__` metadata so `vendor_exclusions` are preserved."""
+    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/scraped_leads?select=metadata&email=eq.{STAGING_BATCH_KEY}&limit=1"
     headers = {
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
     }
-
-    resp = requests.get(endpoint, headers=headers, timeout=20)
-    if not resp.ok:
-        print(f"[StageLeadsDirect] Warning: category scan returned HTTP {resp.status_code}: {resp.text[:250]}")
-        return 0, 0
-
-    rows = resp.json()
-    if not isinstance(rows, list):
-        return 0, 0
-
-    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat().replace("+00:00", "Z")
-    categories_count = len(rows)
-    total_leads = 0
-
-    for row in rows:
-        meta = row.get("metadata") or {}
-        leads = meta.get("leads") if isinstance(meta.get("leads"), list) else []
-        row_updated = str(row.get("updated_at") or "")
-        for lead in leads:
-            if not isinstance(lead, dict):
-                continue
-            disc = str(lead.get("discovered_at") or row_updated or "")
-            if not disc or disc >= cutoff_iso:
-                total_leads += 1
-
-    return total_leads, categories_count
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=15)
+        if resp.ok:
+            rows = resp.json()
+            if isinstance(rows, list) and rows and isinstance(rows[0].get("metadata"), dict):
+                return dict(rows[0]["metadata"])
+    except Exception as exc:
+        print(f"[StageLeadsDirect] Warning reading existing staging metadata: {exc}")
+    return {}
 
 
 def build_email_html(
+    staged_ist_str: str,
     scheduled_ist_str: str,
-    leads_count: int,
+    tenders_count: int,
     categories_count: int,
     dashboard_url: str,
     sender_email: str,
@@ -114,7 +157,7 @@ def build_email_html(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Lead Scraper Review Window Active</title>
+  <title>GeM Tender Staging Review</title>
 </head>
 <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0b0f19; color: #f3f4f6;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #0b0f19; padding: 32px 16px;">
@@ -124,13 +167,13 @@ def build_email_html(
           <tr>
             <td style="padding: 28px 32px; background: linear-gradient(135deg, #1e1b4b 0%, #311042 100%); border-bottom: 1px solid #374151; text-align: center;">
               <span style="display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: #f59e0b; background-color: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.3); padding: 4px 12px; border-radius: 9999px; margin-bottom: 12px;">
-                ⚡ 30-Minute Review Staging Window
+                🛡️ GeM Tender Review Staging
               </span>
               <h1 style="margin: 0; font-size: 24px; font-weight: 800; color: #ffffff; letter-spacing: -0.5px;">
-                Zivic Nexus Lead Engine
+                Zivic Nexus GeM Lead Engine
               </h1>
-              <p style="margin: 6px 0 0; font-size: 14px; color: #d1d5db;">
-                GeM Tender Radar &amp; AI Lead Scraper Ran Successfully
+              <p style="margin: 6px 0 0; font-size: 13px; color: #d1d5db;">
+                Staged at {staged_ist_str}
               </p>
             </td>
           </tr>
@@ -138,24 +181,23 @@ def build_email_html(
             <td style="padding: 32px;">
               <div style="background: rgba(245, 158, 11, 0.08); border-left: 4px solid #f59e0b; padding: 16px; border-radius: 6px; margin-bottom: 24px;">
                 <p style="margin: 0 0 6px; font-weight: 700; color: #fbbf24; font-size: 15px;">
-                  ⏳ Delivery Paused for 30 Minutes
+                  ⏰ Scheduled Vendor Delivery: {scheduled_ist_str}
                 </p>
                 <p style="margin: 0; font-size: 13.5px; color: #d1d5db; line-height: 1.5;">
-                  The GeM tender scraper just finished its scan and discovered fresh tenders.
-                  WhatsApp template and companion email dispatch to subscribed vendors is
-                  <strong>held until {scheduled_ist_str} IST</strong> (30-minute verification window).
+                  Active GeM government tenders from Firestore are staged for admin verification ahead of vendor delivery at
+                  <strong>{scheduled_ist_str}</strong>.
                 </p>
               </div>
               <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 24px;">
                 <tr>
                   <td width="48%" style="background-color: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 16px; text-align: center;">
-                    <div style="font-size: 28px; font-weight: 800; color: #10b981;">{leads_count}</div>
-                    <div style="font-size: 12px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; margin-top: 4px;">Fresh Leads Discovered</div>
+                    <div style="font-size: 28px; font-weight: 800; color: #10b981;">{tenders_count}</div>
+                    <div style="font-size: 12px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; margin-top: 4px;">Active GeM Tenders</div>
                   </td>
                   <td width="4%"></td>
                   <td width="48%" style="background-color: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 16px; text-align: center;">
                     <div style="font-size: 28px; font-weight: 800; color: #6366f1;">{categories_count}</div>
-                    <div style="font-size: 12px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; margin-top: 4px;">Active Categories</div>
+                    <div style="font-size: 12px; text-transform: uppercase; color: #9ca3af; letter-spacing: 0.5px; margin-top: 4px;">GeM Categories</div>
                   </td>
                 </tr>
               </table>
@@ -168,14 +210,11 @@ def build_email_html(
                   </td>
                 </tr>
               </table>
-              <p style="margin: 20px 0 0; text-align: center; font-size: 12px; color: #6b7280;">
-                Automatic dispatch will execute at <strong>{scheduled_ist_str} IST</strong> if no manual action is taken.
-              </p>
             </td>
           </tr>
           <tr>
             <td style="padding: 20px 32px; background-color: #0f172a; border-top: 1px solid #1f2937; text-align: center; font-size: 11px; color: #6b7280;">
-              Sent directly by Zivic Nexus Scraper Staging Controller (Zero-Vercel)<br>
+              Sent directly by Zivic Nexus GeM Staging Controller<br>
               Sender: <code>{sender_email}</code> &bull; Recipient: <code>{target_email}</code>
             </td>
           </tr>
@@ -188,11 +227,12 @@ def build_email_html(
 
 
 def send_admin_staging_email(
+    staged_ist_str: str,
     scheduled_ist_str: str,
-    leads_count: int,
+    tenders_count: int,
     categories_count: int,
     platform_base_url: str,
-) -> tuple[bool, str | None]:
+) -> Tuple[bool, str | None]:
     sender_email = get_env("AI_LEAD_SCRAPER_EMAIL_NOTFCN_URL", "comblopez@gmail.com")
     sender_pass = get_env("AI_LEAD_SCRAPER_EMAIL_NOTFCN_KEY")
     target_email = get_env("TARGET_ADMIN_EMAIL", "zivicnexus@gmail.com")
@@ -204,17 +244,18 @@ def send_admin_staging_email(
         return False, None
 
     dashboard_url = f"{platform_base_url.rstrip('/')}/dashboard/admin"
-    subject = f"🔔 Action Required: GeM Tender Scraper Ran ({leads_count} Leads) — 30-Minute Staging Window Active"
+    subject = f"🛡️ GeM Tender Review Staged ({tenders_count} Active GeM Tenders) — Delivery {scheduled_ist_str}"
     text_body = (
         f"Hello Admin,\n\n"
-        f"The GeM Tender Radar cron job ran successfully!\n\n"
-        f"Discovered {leads_count} fresh inquiries across {categories_count} categories.\n"
-        f"Delivery to vendors is paused until {scheduled_ist_str} IST.\n\n"
-        f"Review, edit, drop leads, or dispatch early here: {dashboard_url}\n"
+        f"GeM Tender staging ran at {staged_ist_str}.\n\n"
+        f"Active GeM Tenders in Firestore: {tenders_count} across {categories_count} categories.\n"
+        f"Scheduled vendor delivery: {scheduled_ist_str}.\n\n"
+        f"Review, edit, drop leads per vendor, or dispatch early here: {dashboard_url}\n"
     )
     html_body = build_email_html(
+        staged_ist_str=staged_ist_str,
         scheduled_ist_str=scheduled_ist_str,
-        leads_count=leads_count,
+        tenders_count=tenders_count,
         categories_count=categories_count,
         dashboard_url=dashboard_url,
         sender_email=sender_email,
@@ -276,10 +317,15 @@ def upsert_staging_batch(
 def main() -> int:
     load_local_env_fallback()
 
-    parser = argparse.ArgumentParser(description="Direct-to-DB Lead Staging Controller (Zero-Vercel)")
-    parser.add_argument("--minutes", type=int, default=30, help="Review window duration in minutes (default: 30)")
-    parser.add_argument("--source", type=str, default="gem_scraper_actions", help="Trigger source identifier")
-    parser.add_argument("--dry-run", action="store_true", help="Scan COMBLOPEZ read-only without writing or emailing")
+    parser = argparse.ArgumentParser(description="Direct-to-DB GeM Tender Staging Controller (Manual / Zero-Vercel)")
+    parser.add_argument(
+        "--minutes",
+        type=int,
+        default=None,
+        help="Optional override duration in minutes (default: next morning 9:00 AM IST)",
+    )
+    parser.add_argument("--source", type=str, default="gem_scraper_manual", help="Trigger source identifier")
+    parser.add_argument("--dry-run", action="store_true", help="Scan GeM Firestore read-only without writing or emailing")
     args = parser.parse_args()
 
     supabase_url = get_env("COMBLOPEZ_SUPABASE_PROJECT2_URL")
@@ -294,38 +340,51 @@ def main() -> int:
         return 1
 
     now_utc = datetime.now(timezone.utc)
-    scheduled_utc = now_utc + timedelta(minutes=max(1, args.minutes))
+    if args.minutes is not None and args.minutes > 0:
+        scheduled_utc = now_utc + timedelta(minutes=args.minutes)
+    else:
+        scheduled_utc = compute_next_morning_9am_ist(now_utc)
+
+    duration_minutes = max(1, int((scheduled_utc - now_utc).total_seconds() // 60))
     staged_at_iso = now_utc.isoformat().replace("+00:00", "Z")
     scheduled_iso = scheduled_utc.isoformat().replace("+00:00", "Z")
-    scheduled_ist_str = scheduled_utc.astimezone(IST_TZ).strftime("%I:%M %p").lstrip("0")
+    staged_ist_str = now_utc.astimezone(IST_TZ).strftime("%a, %d %b, %I:%M %p IST")
+    scheduled_ist_str = scheduled_utc.astimezone(IST_TZ).strftime("%a, %d %b, %I:%M %p IST")
     batch_id = f"batch_{int(time.time() * 1000)}"
 
-    leads_count, categories_count = scan_comblopez_category_pools(supabase_url, service_key)
+    tenders_count, categories_count = scan_gem_firestore_category_pools()
     print(
-        f"[StageLeadsDirect] Scanned COMBLOPEZ: leads={leads_count}, categories={categories_count}, "
-        f"window={args.minutes}m, scheduled={scheduled_ist_str} IST, source={args.source}"
+        f"[StageLeadsDirect] Scanned GeM Firestore: active_tenders={tenders_count}, categories={categories_count}, "
+        f"scheduled={scheduled_ist_str}, source={args.source}"
     )
 
     if args.dry_run:
         print(f"[StageLeadsDirect] DRY-RUN complete (batch_id={batch_id}). No DB write or email sent.")
         return 0
 
+    existing_meta = fetch_existing_staging_metadata(supabase_url, service_key)
+    preserved_exclusions = existing_meta.get("vendor_exclusions") if isinstance(existing_meta.get("vendor_exclusions"), dict) else {}
+
     email_sent, msg_id = send_admin_staging_email(
+        staged_ist_str=staged_ist_str,
         scheduled_ist_str=scheduled_ist_str,
-        leads_count=leads_count,
+        tenders_count=tenders_count,
         categories_count=categories_count,
         platform_base_url=platform_base_url,
     )
 
     batch_metadata = {
+        **existing_meta,
         "batch_id": batch_id,
         "status": "staged",
         "staged_at": staged_at_iso,
         "scheduled_delivery_at": scheduled_iso,
-        "duration_minutes": max(1, args.minutes),
+        "duration_minutes": duration_minutes,
         "trigger_source": args.source,
-        "leads_count": leads_count,
+        "leads_count": tenders_count,
+        "gem_tenders_count": tenders_count,
         "categories_count": categories_count,
+        "vendor_exclusions": preserved_exclusions,
         "dispatched_at": None,
         "dispatched_by": None,
     }
@@ -338,7 +397,7 @@ def main() -> int:
     if not ok:
         return 1
 
-    print(f"[StageLeadsDirect] Staging batch {batch_id} saved directly to COMBLOPEZ (0 Vercel calls).")
+    print(f"[StageLeadsDirect] GeM staging batch {batch_id} saved directly to COMBLOPEZ (exclusions preserved).")
     return 0
 
 
