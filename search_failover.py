@@ -628,8 +628,8 @@ def search_apify(query: str) -> Optional[List[Dict[str, str]]]:
         try:
             _record_usage("apify", key)
             url = f"https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token={key}"
-            payload = {"queries": query, "resultsPerPage": 10, "maxPagesPerQuery": 1, "countryCode": "IN"}
-            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
+            payload = {"queries": query, "resultsPerPage": 10, "maxPagesPerQuery": 1, "countryCode": "in"}
+            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=90)
             if res.status_code in (200, 201):
                 data = res.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -638,8 +638,10 @@ def search_apify(query: str) -> Optional[List[Dict[str, str]]]:
                         {"title": o.get("title", ""), "link": o.get("url", ""), "snippet": o.get("description", "")}
                         for o in organic
                     ])
-            elif res.status_code in (400, 401, 402, 403, 429):
+            elif res.status_code in (401, 402, 403, 429):
                 _mark_key_failed("apify", key)
+            else:
+                logger.warning(f"Apify HTTP {res.status_code}: {res.text[:160]}")
         except Exception as e:
             logger.debug(f"Apify connection error: {e}")
     return None
